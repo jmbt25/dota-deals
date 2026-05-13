@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-13T20:30:01Z",
+  "report_date": "2026-05-13",
+  "status": "operational",
+  "data_quality": {
+    "ingest_run_id": "a7c1f3d2-9b6e-4e1a-8d3f-2c5e8a1b9d6f",
+    "ingest_status": "success",
+    "missing_items": []
+  },
+  "scores": [
+    {
+      "item_id": 1,
+      "market_hash_name": "Demon Eater",
+      "name": "Demon Eater",
+      "category": "arcana",
+      "hero": "Shadow Fiend",
+      "current_price": "34.50",
+      "computed_for": "2026-05-13",
+      "buy_score": 0.78,
+      "components": {
+        "price_zscore": 0.71,
+        "supply_velocity": 0.81,
+        "event_proximity": 0.62,
+        "comparables_delta": 0.68
+      },
+      "explanation": "Priced below recent baseline",
+      "null_signals": []
+    },
+    {
+      "item_id": 2,
+      "market_hash_name": "Manifold Paradox",
+      "name": "Manifold Paradox",
+      "category": "arcana",
+      "hero": "Phantom Assassin",
+      "current_price": "127.80",
+      "computed_for": "2026-05-13",
+      "buy_score": 0.72,
+      "components": {
+        "price_zscore": 0.60,
+        "supply_velocity": 0.77,
+        "event_proximity": 0.55,
+        "comparables_delta": 0.70
+      },
+      "explanation": "Listings contracting",
+      "null_signals": []
+    },
+    {
+      "item_id": 3,
+      "market_hash_name": "Fractal Horns of Inner Abysm",
+      "name": "Fractal Horns of Inner Abysm",
+      "category": "arcana",
+      "hero": "Terrorblade",
+      "current_price": "58.60",
+      "computed_for": "2026-05-13",
+      "buy_score": 0.67,
+      "components": {
+        "price_zscore": 0.58,
+        "supply_velocity": 0.63,
+        "event_proximity": -0.49,
+        "comparables_delta": 0.71
+      },
+      "explanation": "Priced below same-category peers",
+      "null_signals": []
+    },
+    {
+      "item_id": 4,
+      "market_hash_name": "Tempest Helm of the Thundergod",
+      "name": "Tempest Helm of the Thundergod",
+      "category": "immortal",
+      "hero": "Zeus",
+      "current_price": "14.30",
+      "computed_for": "2026-05-13",
+      "buy_score": 0.57,
+      "components": {
+        "price_zscore": -0.36,
+        "supply_velocity": 0.72,
+        "event_proximity": -0.31,
+        "comparables_delta": 0.59
+      },
+      "explanation": "Listings contracting",
+      "null_signals": []
+    },
+    {
+      "item_id": 5,
+      "market_hash_name": "The Magus Cypher",
+      "name": "The Magus Cypher",
+      "category": "immortal",
+      "hero": null,
+      "current_price": "9.60",
+      "computed_for": "2026-05-13",
+      "buy_score": 0.42,
+      "components": {
+        "price_zscore": -0.22,
+        "supply_velocity": 0.48,
+        "event_proximity": null,
+        "comparables_delta": 0.53
+      },
+      "explanation": "Priced below same-category peers",
+      "null_signals": ["event_proximity"]
+    }
+  ]
+}

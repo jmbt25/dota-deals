@@ -222,6 +222,16 @@ __marimo__/
 *.db-journal
 *.sqlite
 *.sqlite3
-data/
-out/
+# Top-level data/ holds the SQLite path from Settings; don't commit live DBs.
+# (Use a leading slash so this rule doesn't also catch public/data/, where
+# the published JSON files live.)
+/data/
+/out/
+# The pipeline writes live JSON into public/data/; only the fixtures
+# subtree is committed.
+public/data/*.json
+public/data/items/
+public/data/history/
+!public/data/fixtures/
+!public/data/fixtures/**
 

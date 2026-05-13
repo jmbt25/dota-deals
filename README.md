@@ -49,6 +49,8 @@ test. If something looks like it broke, start from the linked test.
 
 ## How to run it
 
+### Pipeline
+
 Requires **Python 3.12** (pinned `>=3.12,<3.13`). No secrets needed — Steam
 Market endpoints are public.
 
@@ -86,6 +88,50 @@ warmup windows, failure modes in the logs) live in
 [`docs/INGESTION.md`](docs/INGESTION.md), [`docs/UNIVERSE.md`](docs/UNIVERSE.md),
 [`docs/SIGNALS.md`](docs/SIGNALS.md), and
 [`docs/SCORING.md`](docs/SCORING.md).
+
+### Frontend
+
+The single-page frontend at [`public/index.html`](public/index.html) is
+a vanilla-JS static site that `fetch()`es `data/*.json` siblings — no
+build step, no framework, no API layer. The pipeline writes the JSON
+files; Cloudflare Pages (Phase 8) serves them.
+
+`fetch()` from `file://` is blocked by browsers, so serve `public/` over
+HTTP locally:
+
+```bash
+cd public/
+python -m http.server 8000
+# visit http://localhost:8000
+```
+
+The frontend has five explicit states — LOADING, WARMUP, OPERATIONAL,
+DEGRADED, ERROR — driven by `health.json.status` and `latest.json.scores`.
+Hand-crafted JSON fixtures in
+[`public/data/fixtures/`](public/data/fixtures/) let you exercise each
+state without running the pipeline:
+
+```bash
+# operational
+cp public/data/fixtures/latest-operational.json public/data/latest.json
+cp public/data/fixtures/health-operational.json public/data/health.json
+mkdir -p public/data/items
+cp public/data/fixtures/items/1.json             public/data/items/1.json
+
+# warmup (cold-start, no scores yet)
+cp public/data/fixtures/latest-warmup.json   public/data/latest.json
+cp public/data/fixtures/health-warmup.json   public/data/health.json
+
+# degraded (ingest ran partial)
+cp public/data/fixtures/latest-degraded.json public/data/latest.json
+cp public/data/fixtures/health-degraded.json public/data/health.json
+
+# error: delete or rename one of those files — the fetch will 404 and
+# the frontend renders the error state with a Retry button
+```
+
+Refresh the browser after each swap. The wire-format contract is documented
+in [`docs/PUBLISH.md`](docs/PUBLISH.md); the fixtures conform to it.
 
 ## Status
 

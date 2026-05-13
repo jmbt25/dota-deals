@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-13T20:30:01Z",
+  "status": "operational",
+  "last_run": {
+    "run_id": "a7c1f3d2-9b6e-4e1a-8d3f-2c5e8a1b9d6f",
+    "kind": "scoring",
+    "finished_at": "2026-05-13T20:00:14Z",
+    "status": "success"
+  },
+  "data_coverage": {
+    "items_tracked": 612,
+    "items_with_signals": 540,
+    "days_of_history": 48,
+    "first_observation_at": "2026-03-26T08:00:00Z"
+  },
+  "warmup_estimate": {
+    "days_remaining": null
+  }
+}

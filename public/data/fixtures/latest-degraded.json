@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-13T20:30:01Z",
+  "report_date": "2026-05-13",
+  "status": "degraded",
+  "data_quality": {
+    "ingest_run_id": "f8a2b1e4-5c3d-4f7e-9a8b-2d1e7c4a9f6e",
+    "ingest_status": "partial",
+    "missing_items": [
+      "Item That Steam 404'd",
+      "Item Whose Endpoint Timed Out",
+      "Item Delisted Mid-Run"
+    ]
+  },
+  "scores": [
+    {
+      "item_id": 1,
+      "market_hash_name": "Demon Eater",
+      "name": "Demon Eater",
+      "category": "arcana",
+      "hero": "Shadow Fiend",
+      "current_price": "34.50",
+      "computed_for": "2026-05-13",
+      "buy_score": 0.78,
+      "components": {
+        "price_zscore": 0.71,
+        "supply_velocity": 0.81,
+        "event_proximity": 0.62,
+        "comparables_delta": 0.68
+      },
+      "explanation": "Priced below recent baseline",
+      "null_signals": []
+    },
+    {
+      "item_id": 2,
+      "market_hash_name": "Manifold Paradox",
+      "name": "Manifold Paradox",
+      "category": "arcana",
+      "hero": "Phantom Assassin",
+      "current_price": "127.80",
+      "computed_for": "2026-05-13",
+      "buy_score": 0.55,
+      "components": {
+        "price_zscore": 0.60,
+        "supply_velocity": null,
+        "event_proximity": 0.55,
+        "comparables_delta": 0.70
+      },
+      "explanation": "Priced below recent baseline",
+      "null_signals": ["supply_velocity"]
+    }
+  ]
+}
