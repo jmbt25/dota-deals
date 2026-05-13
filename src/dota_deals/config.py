@@ -68,6 +68,14 @@ class Settings(BaseSettings):
     # without risking the request size cap.
     d1_max_batch_size: int = Field(default=100, ge=1, le=100)
 
+    # Soft warning threshold for cumulative rows-read on a single
+    # :class:`D1Connection`. Above this, the connection logs a WARNING
+    # on close with the total — useful for spotting an accidental
+    # full-table scan or a missing index that's hidden from cost-per-run
+    # accounting until the bill arrives. Default 1M is generous for v1
+    # (800 items x 365 days of price history is well under).
+    d1_daily_budget_warn: int = Field(default=1_000_000, ge=0)
+
     @model_validator(mode="after")
     def _check_cadence_divides_day(self) -> Self:
         """Polling slots must align to a fixed pattern within a UTC day."""

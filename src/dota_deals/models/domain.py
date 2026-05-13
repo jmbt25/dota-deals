@@ -64,6 +64,24 @@ class ListingPoint(BaseModel):
     listings_count: int = Field(ge=0)
 
 
+class LatestObservation(BaseModel):
+    """Per-item snapshot of the most recent observed price + listing count.
+
+    Backed by the ``latest_observation`` table — a cache maintained
+    alongside ``price_history`` / ``listing_history`` so callers asking
+    "what's the current price" don't have to scan history. Older
+    observations don't overwrite a newer cached row; see
+    ``upsert_latest_observation`` in the repository layer.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    item_id: int
+    observed_at: datetime
+    lowest_cents: Cents = Field(gt=0)
+    listings_count: int | None = Field(default=None, ge=0)
+
+
 class Signal(BaseModel):
     """A computed signal value for one item on one date."""
 
