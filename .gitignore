@@ -224,6 +224,10 @@ __marimo__/
 *.sqlite3
 # wrangler caches local D1 shim DBs and build metadata here.
 .wrangler/
+
+# Phase 11 (TypeScript Pages Functions).
+node_modules/
+*.tsbuildinfo
 # Top-level data/ holds the SQLite path from Settings; don't commit live DBs.
 # (Use a leading slash so this rule doesn't also catch public/data/, where
 # the published JSON files live.)

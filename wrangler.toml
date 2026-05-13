@@ -1,16 +1,31 @@
 # Wrangler configuration for dota-deals.
 #
-# Phase 9: only the D1 binding is populated, because that's all
-# `wrangler d1 migrations apply` needs. There is no Worker yet — that
-# arrives in Phase 11, at which point `name`, `compatibility_date`, and
-# the `main` entry point start mattering.
+# Phase 11 turned this into a Pages project: `pages_build_output_dir`
+# declares `./public` as the static-asset root, which together with the
+# presence of `functions/` tells wrangler (and the Cloudflare Pages
+# build system) to deploy both static assets and Pages Functions in
+# one shot. The same file still serves Phase 9's
+# `wrangler d1 migrations apply` invocation in CI — the D1 binding
+# below is what that command resolves.
 #
 # `database_id` is the UUID Cloudflare assigns; `database_name` is the
 # human-readable name shown in the dashboard and accepted by the
 # wrangler CLI (e.g. `wrangler d1 migrations apply dota-deals`).
+#
+# IMPORTANT: when this file changed in Phase 11, the Cloudflare Pages
+# dashboard's deploy command also had to change from
+# `npx wrangler pages deploy public --project-name=dota-deals`
+# to
+# `npx wrangler pages deploy . --project-name=dota-deals`
+# — the `.` so wrangler picks up both `public/` (via
+# `pages_build_output_dir`) AND `functions/` automatically. See
+# docs/DEPLOYMENT.md "Phase 11 dashboard change" for the recovery
+# story if the deploy fails after a fresh clone of this config.
 
 name = "dota-deals"
 compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+pages_build_output_dir = "./public"
 
 # Default `migrations_dir = "./migrations"` is implicit; the SQL file
 # lives at `migrations/0001_initial.sql` relative to this file.

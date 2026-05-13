@@ -15,12 +15,17 @@
 └─────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────┐
-│  Cloudflare Pages → dotadeals.com  (Phase 10-12 STALE)       │
-│  serves the public/data/ JSON committed at Phase 10 ship.    │
-│  The pipeline no longer produces publish output; Phase 11    │
-│  builds the Worker that reads D1 directly, Phase 12 wires    │
-│  the frontend to the Worker, then this static-files path     │
-│  retires entirely.                                           │
+│  Cloudflare Pages → dotadeals.com                            │
+│                                                              │
+│   Static frontend (public/)  STALE through Phase 12          │
+│   serves the public/data/ JSON committed at Phase 10 ship.   │
+│                                                              │
+│   Pages Functions (functions/api/*)  LIVE as of Phase 11     │
+│   /api/health, /api/report/latest, /api/report/:date,        │
+│   /api/items/:id, /api/runs — read directly from D1.         │
+│                                                              │
+│   Phase 12 wires the frontend at fetch() to /api/, ending    │
+│   the static-files stale window.                             │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -45,8 +50,11 @@ this window:
 - **Phase 10** (this commit): the pipeline stops generating
   `public/data/*.json`. The committed files frozen at the Phase 10
   ship commit are what Pages keeps serving.
-- **Phase 11**: a TypeScript Worker is built that reads D1 directly
-  and serves the same wire format the static files used.
+- **Phase 11** (this commit): a TypeScript Worker (Pages Functions)
+  serves the same wire format the static files used, reading D1
+  directly. Endpoints live at `/api/health`, `/api/report/latest`,
+  `/api/report/:date`, `/api/items/:id`, `/api/runs`. The frontend
+  isn't pointed at them yet, so the live page stays stale.
 - **Phase 12**: the frontend's `fetch()` calls are pointed at the
   Worker. From this point the page is live against D1 again.
 - **Phase 13**: the static-files path retires; `publish/` module
@@ -89,19 +97,26 @@ Cloudflare shows the token value exactly once.
 ## One-time: Cloudflare Pages
 
 The Pages project continues to exist through Phase 12 (the frontend
-deploys at every push to `main`), so this setup stays valid. If
-you're bootstrapping a fresh project mid-Phase 10:
+deploys at every push to `main`), so this setup stays valid. **Phase 11
+changed the deploy command** to also pick up the `functions/`
+directory — see "Phase 11 dashboard change" below. If you're
+bootstrapping a fresh project mid-Phase 10+:
 
 1. **Cloudflare → Pages → Create application → Connect to Git.** Branch: `main`.
 2. **Build settings:**
 
    | Field | Value |
    |---|---|
-   | Framework preset | **None** — this is a static site |
+   | Framework preset | **None** — this is a static site plus Pages Functions |
    | Build command | **(empty)** |
    | Build output directory | **`public`** |
    | Root directory | **(empty / project root)** |
-   | Deploy command | **`npx wrangler pages deploy public --project-name=YOUR_PROJECT_NAME`** |
+   | Deploy command | **`npx wrangler pages deploy . --project-name=YOUR_PROJECT_NAME`** (note the `.`, not `public`) |
+
+   The `.` is load-bearing: it tells wrangler to honour the
+   `pages_build_output_dir = "./public"` line in `wrangler.toml` AND
+   to pick up the `functions/` directory at the same time. With
+   `public` as the literal arg, Functions don't deploy.
 
 3. **Pages-side env vars (Production):**
 
@@ -113,6 +128,20 @@ you're bootstrapping a fresh project mid-Phase 10:
 4. **Custom domain** (optional): Pages → your project → Custom
    domains → `dotadeals.com`. DNS handles itself if the domain is
    registered through Cloudflare.
+
+### Phase 11 dashboard change
+
+When Phase 11 shipped (`functions/api/*.ts`), the Pages dashboard's
+**Deploy command** had to change from
+`npx wrangler pages deploy public --project-name=dota-deals` to
+`npx wrangler pages deploy . --project-name=dota-deals`. The trailing
+arg is the path wrangler hands to its uploader. With `public`, only
+the static assets in `public/` get deployed. With `.`, wrangler reads
+`wrangler.toml`'s `pages_build_output_dir` to find the static assets
+AND walks the project root for `functions/` to pick up Pages
+Functions. If you redeploy Phase 11+ code with the old command, the
+API endpoints will return 404 — the Functions never made it onto the
+edge. Fix is a one-character edit in the dashboard.
 
 ## One-time: D1 schema
 
