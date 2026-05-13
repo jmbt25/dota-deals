@@ -2,9 +2,10 @@
 
 Sub-commands:
 
-* ``universe``  — refresh the items universe via Steam search.
-* ``ingest``    — fetch current prices/listings for the items in a file.
-* (Phase 4b+) ``signals``, ``score``, ``report``.
+* ``universe refresh`` — refresh the items universe via Steam search.
+* ``ingest``           — fetch current prices/listings for the items in a file.
+* ``signals compute``  — compute all four signals for every active item on a date.
+* (Phase 5) ``score``, ``report``.
 
 The :data:`app` object is the Typer application; ``[project.scripts]`` in
 ``pyproject.toml`` wires the ``dota-deals`` console script to :func:`main`.
@@ -15,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import uuid
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -25,6 +27,7 @@ from dota_deals.ingest.runner import run_ingestion
 from dota_deals.ingest.universe import refresh_universe
 from dota_deals.logging import configure_logging, get_logger
 from dota_deals.models.domain import RunSummary
+from dota_deals.signals.runner import compute_signals_for
 
 app = typer.Typer(
     name="dota-deals",
@@ -40,6 +43,14 @@ universe_app = typer.Typer(
     add_completion=False,
 )
 app.add_typer(universe_app, name="universe")
+
+signals_app = typer.Typer(
+    name="signals",
+    help="Compute and inspect signals.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(signals_app, name="signals")
 
 
 def _read_items_file(path: Path) -> list[str]:
@@ -139,6 +150,54 @@ def universe_refresh() -> None:
         status=summary.status,
         items_ok=summary.items_ok,
         items_quarantined=summary.items_quarantined,
+        items_failed=summary.items_failed,
+    )
+
+    if summary.status == "failed":
+        raise typer.Exit(code=1)
+
+
+@signals_app.command("compute")
+def signals_compute(
+    date_str: Annotated[
+        str | None,
+        typer.Option(
+            "--date",
+            "-d",
+            help="UTC date YYYY-MM-DD; defaults to today UTC.",
+        ),
+    ] = None,
+) -> None:
+    """Compute all four signals for every active item on the given UTC date."""
+    if date_str is None:
+        as_of = datetime.now(UTC).date()
+    else:
+        try:
+            as_of = date.fromisoformat(date_str)
+        except ValueError as e:
+            raise typer.BadParameter(f"invalid date {date_str!r}: {e}") from e
+
+    settings = load_settings()
+    parent_run_id = str(uuid.uuid4())
+    configure_logging(run_id=parent_run_id, log_format=settings.log_format)
+    log = get_logger("dota_deals.cli.signals").bind(
+        source="cli",
+        parent_run_id=parent_run_id,
+    )
+
+    run_id = str(uuid.uuid4())
+    log.info("starting signals compute", as_of=as_of.isoformat())
+    summary: RunSummary = compute_signals_for(
+        as_of=as_of,
+        settings=settings,
+        run_id=run_id,
+        parent_run_id=parent_run_id,
+    )
+
+    log.info(
+        "signals compute complete",
+        status=summary.status,
+        items_ok=summary.items_ok,
         items_failed=summary.items_failed,
     )
 

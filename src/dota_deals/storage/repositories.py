@@ -18,12 +18,14 @@ from datetime import UTC, date, datetime, timedelta
 from dota_deals.models.domain import (
     BuyScore,
     Item,
+    ItemCategory,
     ListingPoint,
     PricePoint,
     RunStatus,
     RunSummary,
     Signal,
 )
+from dota_deals.models.events import EventRecord
 from dota_deals.storage.db import IntegrityViolation, StorageError
 
 
@@ -121,6 +123,18 @@ def get_item_by_hash(conn: sqlite3.Connection, market_hash: str) -> Item | None:
     return _row_to_item(row) if row is not None else None
 
 
+def get_item_by_id(conn: sqlite3.Connection, item_id: int) -> Item | None:
+    """Return the item with the given ``item_id`` if present, else ``None``."""
+    try:
+        row = conn.execute(
+            f"SELECT {_ITEM_COLUMNS} FROM items WHERE item_id = ?",
+            (item_id,),
+        ).fetchone()
+    except sqlite3.Error as e:
+        raise StorageError(f"lookup failed for item_id={item_id}: {e}") from e
+    return _row_to_item(row) if row is not None else None
+
+
 def active_items(conn: sqlite3.Connection) -> list[Item]:
     """Return all rows in ``items`` with ``active = 1``, ordered by ``item_id``."""
     try:
@@ -129,6 +143,38 @@ def active_items(conn: sqlite3.Connection) -> list[Item]:
         ).fetchall()
     except sqlite3.Error as e:
         raise StorageError(f"active_items query failed: {e}") from e
+    return [_row_to_item(row) for row in rows]
+
+
+def active_items_in_category(
+    conn: sqlite3.Connection,
+    category: ItemCategory,
+    *,
+    exclude_item_id: int | None = None,
+) -> list[Item]:
+    """Return active items in ``category``; optionally drop ``exclude_item_id``.
+
+    The optional exclusion is used by Signal 4 (comparables) so an item isn't
+    in its own peer set.
+    """
+    try:
+        if exclude_item_id is None:
+            rows = conn.execute(
+                f"SELECT {_ITEM_COLUMNS} FROM items "
+                "WHERE active = 1 AND category = ? ORDER BY item_id",
+                (category,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT {_ITEM_COLUMNS} FROM items "
+                "WHERE active = 1 AND category = ? AND item_id != ? "
+                "ORDER BY item_id",
+                (category, exclude_item_id),
+            ).fetchall()
+    except sqlite3.Error as e:
+        raise StorageError(
+            f"active_items_in_category query failed for category={category!r}: {e}"
+        ) from e
     return [_row_to_item(row) for row in rows]
 
 
@@ -399,6 +445,100 @@ def upsert_latest_observation(
         ) from e
     except sqlite3.Error as e:
         raise StorageError(f"latest_observation upsert failed: {e}") from e
+
+
+# ---- events ----
+
+
+def _row_to_event(row: sqlite3.Row) -> EventRecord:
+    return EventRecord(
+        event_id=int(row["event_id"]),
+        kind=row["kind"],
+        name=row["name"],
+        start_date=date.fromisoformat(row["start_date"]),
+        end_date=date.fromisoformat(row["end_date"]) if row["end_date"] else None,
+        confidence=row["confidence"],
+        notes=row["notes"],
+    )
+
+
+def insert_event(conn: sqlite3.Connection, event: EventRecord) -> int:
+    """Insert ``event`` and return the resolved ``event_id``.
+
+    The events table is hand-curated; this is the entry point used by seed
+    scripts and tests. ``event.event_id`` is ignored on input.
+    """
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO events (kind, name, start_date, end_date, confidence, notes)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.kind,
+                event.name,
+                event.start_date.isoformat(),
+                event.end_date.isoformat() if event.end_date else None,
+                event.confidence,
+                event.notes,
+            ),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        raise IntegrityViolation(f"events insert failed: {e}") from e
+    except sqlite3.Error as e:
+        raise StorageError(f"events insert failed: {e}") from e
+    if cursor.lastrowid is None:
+        raise StorageError("insert_event returned without a lastrowid")
+    return int(cursor.lastrowid)
+
+
+def next_event_within(
+    conn: sqlite3.Connection, as_of: date, *, days_window: int
+) -> EventRecord | None:
+    """Return the next event with ``start_date`` in ``[as_of, as_of + days_window]``,
+    or ``None`` if no such event exists.
+
+    "Next" = earliest ``start_date``. The window is inclusive on both ends.
+    """
+    if days_window < 0:
+        raise ValueError(f"days_window must be >= 0, got {days_window}")
+    upper = as_of + timedelta(days=days_window)
+    try:
+        row = conn.execute(
+            """
+            SELECT event_id, kind, name, start_date, end_date, confidence, notes
+            FROM events
+            WHERE start_date BETWEEN ? AND ?
+            ORDER BY start_date
+            LIMIT 1
+            """,
+            (as_of.isoformat(), upper.isoformat()),
+        ).fetchone()
+    except sqlite3.Error as e:
+        raise StorageError(f"next_event_within query failed: {e}") from e
+    return _row_to_event(row) if row is not None else None
+
+
+def past_events_of_kind(conn: sqlite3.Connection, kind: str, *, before: date) -> list[EventRecord]:
+    """Return events of ``kind`` whose ``start_date`` is strictly before ``before``.
+
+    Sorted most-recent-first so callers can iterate prior cycles in temporal
+    order.
+    """
+    try:
+        rows = conn.execute(
+            """
+            SELECT event_id, kind, name, start_date, end_date, confidence, notes
+            FROM events
+            WHERE kind = ? AND start_date < ?
+            ORDER BY start_date DESC
+            """,
+            (kind, before.isoformat()),
+        ).fetchall()
+    except sqlite3.Error as e:
+        raise StorageError(f"past_events_of_kind query failed: {e}") from e
+    return [_row_to_event(row) for row in rows]
 
 
 # ---- signals ----

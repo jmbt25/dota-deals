@@ -81,11 +81,16 @@ def connect(path: Path) -> sqlite3.Connection:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.execute("PRAGMA journal_mode = WAL;")
-        # sqlite3.Connection.create_aggregate's typeshed signature expects
-        # ``Callable[[], _AggregateProtocol]``; the class IS such a callable
-        # at runtime, but mypy's structural check doesn't accept a class
-        # type here without an explicit Protocol declaration. The behavior
-        # is correct.
+        # typeshed signature: ``Callable[[], _AggregateProtocol]``. Our class
+        # IS such a callable at runtime, but mypy can't recognize that without
+        # one of:
+        #   1) inheriting from _AggregateProtocol explicitly — blocked because
+        #      _AggregateProtocol is private to the sqlite3 stub (the public
+        #      `sqlite3` module re-exports nothing of the sort), OR
+        #   2) an upstream typeshed fix that loosens the parameter to accept
+        #      class types with structurally-matching step()/finalize() —
+        #      tracked at python/typeshed.
+        # Either path will let us drop this ignore. Until then, it stays.
         conn.create_aggregate("MEDIAN", 1, _MedianAggregate)  # type: ignore[arg-type]
         return conn
     except sqlite3.Error as e:
