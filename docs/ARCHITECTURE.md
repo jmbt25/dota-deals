@@ -281,9 +281,16 @@ must divide 24 evenly — enforced in `Settings`.
 Signal 1 (`price_zscore`) operates on a daily price series, not raw 8-hourly poll
 observations. The "daily price" for an item on a UTC date is the median of all
 `lowest_cents` rows in `price_history` for that item on that date (typically
-three observations per day at v1 cadence). The implementation reads this through
-a parameterized SQL query in `storage.repositories.daily_prices(item_id, days)`;
-it is not persisted. This insulates signal math from cadence changes.
+three observations per day at v1 cadence).
+
+This is exposed as the SQL view `v_daily_price` (one row per `(item_id, utc_date)`,
+grouping `price_history` and applying a `MEDIAN()` aggregate). The view is
+backed by a Python aggregate registered on every connection by
+`storage.db.connect`; selecting from the view from a connection that doesn't
+have the aggregate registered will fail at query time.
+`storage.repositories.daily_prices(item_id, days, as_of)` queries the view to
+return the time-bounded daily series consumed by signals. Nothing is persisted
+beyond the view's definition — this insulates signal math from cadence changes.
 
 ### Run-id lifecycle
 

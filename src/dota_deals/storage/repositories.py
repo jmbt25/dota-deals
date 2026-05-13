@@ -11,8 +11,9 @@ or subclasses — never raw ``sqlite3.*`` types.
 
 from __future__ import annotations
 
+import json
 import sqlite3
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 from dota_deals.models.domain import (
     BuyScore,
@@ -222,20 +223,78 @@ def insert_price_point(conn: sqlite3.Connection, point: PricePoint) -> bool:
     return cursor.rowcount > 0
 
 
-def recent_prices(conn: sqlite3.Connection, item_id: int, days: int) -> list[PricePoint]:
-    """Return all ``price_history`` rows for ``item_id`` within the last
-    ``days`` days, oldest first.
+def recent_prices(
+    conn: sqlite3.Connection,
+    item_id: int,
+    days: int,
+    *,
+    as_of: date,
+) -> list[PricePoint]:
+    """Return ``price_history`` rows for ``item_id`` over a UTC-date window.
+
+    Window is ``[as_of - days + 1, as_of]`` inclusive on both ends — i.e. the
+    last ``days`` UTC days ending at ``as_of``. Sorted oldest-first.
     """
-    raise NotImplementedError
+    if days < 1:
+        raise ValueError(f"days must be >= 1, got {days}")
+    start_date = as_of - timedelta(days=days - 1)
+    try:
+        rows = conn.execute(
+            """
+            SELECT item_id, observed_at, lowest_cents, median_cents, volume_24h
+            FROM price_history
+            WHERE item_id = ?
+              AND date(observed_at) BETWEEN ? AND ?
+            ORDER BY observed_at
+            """,
+            (item_id, start_date.isoformat(), as_of.isoformat()),
+        ).fetchall()
+    except sqlite3.Error as e:
+        raise StorageError(f"recent_prices failed for item_id={item_id}: {e}") from e
+    return [
+        PricePoint(
+            item_id=row["item_id"],
+            observed_at=datetime.fromisoformat(row["observed_at"]),
+            lowest_cents=int(row["lowest_cents"]),
+            median_cents=int(row["median_cents"]) if row["median_cents"] is not None else None,
+            volume_24h=int(row["volume_24h"]) if row["volume_24h"] is not None else None,
+        )
+        for row in rows
+    ]
 
 
-def daily_prices(conn: sqlite3.Connection, item_id: int, days: int) -> list[tuple[date, int]]:
-    """Return ``(utc_date, median_lowest_cents)`` for each of the last ``days``
-    UTC days that has at least one observation for ``item_id``.
+def daily_prices(
+    conn: sqlite3.Connection,
+    item_id: int,
+    days: int,
+    *,
+    as_of: date,
+) -> list[tuple[date, int]]:
+    """Return per-day ``(utc_date, median_lowest_cents)`` for ``item_id``.
 
-    This is the canonical "daily price series" consumed by Signal 1.
+    Window is ``[as_of - days + 1, as_of]`` inclusive on both ends. Days with
+    no observations are simply absent from the result. Sorted oldest-first.
+
+    Queries the ``v_daily_price`` view, which requires the ``MEDIAN``
+    aggregate registered by :func:`dota_deals.storage.db.connect`.
     """
-    raise NotImplementedError
+    if days < 1:
+        raise ValueError(f"days must be >= 1, got {days}")
+    start_date = as_of - timedelta(days=days - 1)
+    try:
+        rows = conn.execute(
+            """
+            SELECT utc_date, lowest_cents
+            FROM v_daily_price
+            WHERE item_id = ?
+              AND utc_date BETWEEN ? AND ?
+            ORDER BY utc_date
+            """,
+            (item_id, start_date.isoformat(), as_of.isoformat()),
+        ).fetchall()
+    except sqlite3.Error as e:
+        raise StorageError(f"daily_prices failed for item_id={item_id}: {e}") from e
+    return [(date.fromisoformat(row["utc_date"]), int(row["lowest_cents"])) for row in rows]
 
 
 # ---- listing_history ----
@@ -264,11 +323,41 @@ def insert_listing_point(conn: sqlite3.Connection, point: ListingPoint) -> bool:
     return cursor.rowcount > 0
 
 
-def recent_listings(conn: sqlite3.Connection, item_id: int, days: int) -> list[ListingPoint]:
-    """Return ``listing_history`` rows for ``item_id`` within the last ``days``
-    days, oldest first.
+def recent_listings(
+    conn: sqlite3.Connection,
+    item_id: int,
+    days: int,
+    *,
+    as_of: date,
+) -> list[ListingPoint]:
+    """Return ``listing_history`` rows for ``item_id`` over a UTC-date window.
+
+    Window is ``[as_of - days + 1, as_of]`` inclusive. Sorted oldest-first.
     """
-    raise NotImplementedError
+    if days < 1:
+        raise ValueError(f"days must be >= 1, got {days}")
+    start_date = as_of - timedelta(days=days - 1)
+    try:
+        rows = conn.execute(
+            """
+            SELECT item_id, observed_at, listings_count
+            FROM listing_history
+            WHERE item_id = ?
+              AND date(observed_at) BETWEEN ? AND ?
+            ORDER BY observed_at
+            """,
+            (item_id, start_date.isoformat(), as_of.isoformat()),
+        ).fetchall()
+    except sqlite3.Error as e:
+        raise StorageError(f"recent_listings failed for item_id={item_id}: {e}") from e
+    return [
+        ListingPoint(
+            item_id=row["item_id"],
+            observed_at=datetime.fromisoformat(row["observed_at"]),
+            listings_count=int(row["listings_count"]),
+        )
+        for row in rows
+    ]
 
 
 # ---- latest_observation ----
@@ -316,13 +405,68 @@ def upsert_latest_observation(
 
 
 def insert_signal(conn: sqlite3.Connection, signal: Signal) -> bool:
-    """Insert (or replace) a signal row. Idempotent on PK collision."""
-    raise NotImplementedError
+    """Insert a signal row. Idempotent on ``(item_id, computed_for, signal_name)``
+    via ``INSERT OR IGNORE``.
+
+    Returns ``True`` if a new row was written, ``False`` on PK collision.
+    """
+    metadata_json: str | None
+    metadata_json = json.dumps(signal.metadata, sort_keys=True) if signal.metadata else None
+    try:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO signals
+                (item_id, computed_for, signal_name, value, metadata_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                signal.item_id,
+                signal.computed_for.isoformat(),
+                signal.signal_name,
+                signal.value,
+                metadata_json,
+            ),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        raise IntegrityViolation(
+            f"signals insert failed for item_id={signal.item_id}, "
+            f"signal_name={signal.signal_name}: {e}"
+        ) from e
+    except sqlite3.Error as e:
+        raise StorageError(f"signals insert failed: {e}") from e
+    return cursor.rowcount > 0
 
 
 def signals_for(conn: sqlite3.Connection, item_id: int, on: date) -> list[Signal]:
-    """Return every signal computed for ``item_id`` on date ``on``."""
-    raise NotImplementedError
+    """Return every signal row computed for ``item_id`` on date ``on``.
+
+    Sorted by ``signal_name`` for stable display.
+    """
+    try:
+        rows = conn.execute(
+            """
+            SELECT item_id, computed_for, signal_name, value, metadata_json
+            FROM signals
+            WHERE item_id = ? AND computed_for = ?
+            ORDER BY signal_name
+            """,
+            (item_id, on.isoformat()),
+        ).fetchall()
+    except sqlite3.Error as e:
+        raise StorageError(
+            f"signals_for failed for item_id={item_id}, on={on.isoformat()}: {e}"
+        ) from e
+    return [
+        Signal(
+            item_id=row["item_id"],
+            computed_for=date.fromisoformat(row["computed_for"]),
+            signal_name=row["signal_name"],
+            value=row["value"],
+            metadata=json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+        )
+        for row in rows
+    ]
 
 
 # ---- buy_scores (derived; not stored separately yet) ----

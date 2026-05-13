@@ -30,6 +30,19 @@ CREATE TABLE IF NOT EXISTS price_history (
 
 CREATE INDEX IF NOT EXISTS ix_price_observed_at ON price_history(observed_at);
 
+-- Per-day median lowest_cents, derived from price_history. The "daily price"
+-- consumed by Signal 1 (price_zscore). Backed by the MEDIAN aggregate
+-- registered on every connection by storage.db.connect; selecting from this
+-- view from a connection that doesn't have MEDIAN registered will fail at
+-- query time.
+CREATE VIEW IF NOT EXISTS v_daily_price AS
+SELECT
+    item_id,
+    date(observed_at)        AS utc_date,
+    MEDIAN(lowest_cents)     AS lowest_cents
+FROM price_history
+GROUP BY item_id, utc_date;
+
 -- Per-poll listing counts. Separate from price because cadence and source can differ.
 CREATE TABLE IF NOT EXISTS listing_history (
     item_id        INTEGER NOT NULL,

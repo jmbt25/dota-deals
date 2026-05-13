@@ -41,4 +41,9 @@ class EventRecord(BaseModel):
 
         :raises ValueError: if ``end_date < start_date``.
         """
-        raise NotImplementedError
+        if self.end_date is not None and self.end_date < self.start_date:
+            raise ValueError(
+                f"end_date {self.end_date.isoformat()} is before start_date "
+                f"{self.start_date.isoformat()}"
+            )
+        return self

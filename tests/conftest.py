@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from dota_deals.config import Settings
+from dota_deals.storage.db import bootstrap_schema, connect
 
 
 @pytest.fixture()
@@ -26,16 +27,12 @@ def db_path(tmp_path: Path) -> Path:
 def db_conn(db_path: Path) -> Generator[sqlite3.Connection, None, None]:
     """Yield an open SQLite connection to an isolated tmp database.
 
-    Foreign keys are enabled and ``schema.sql`` has been applied. The
-    connection is closed and the file removed when the fixture tears down.
+    Uses :func:`dota_deals.storage.db.connect` so the MEDIAN aggregate (and
+    any other connection-level setup) is in place; then bootstraps the
+    schema. The connection is closed when the fixture tears down.
     """
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
-    schema = (
-        Path(__file__).resolve().parent.parent / "src" / "dota_deals" / "storage" / "schema.sql"
-    ).read_text(encoding="utf-8")
-    conn.executescript(schema)
+    conn = connect(db_path)
+    bootstrap_schema(conn)
     try:
         yield conn
     finally:
