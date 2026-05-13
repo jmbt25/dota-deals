@@ -8,8 +8,12 @@ the signal; the implementation handles both correctly.
 
 Algorithm
 ---------
-1. Find the **next event** within 60 days. If none, output ``0.0`` (the
-   signal "doesn't apply right now" — different from null).
+1. Find the **next event** within 60 days. If none, output ``None`` — the
+   signal "does not apply right now", and the scoring layer renormalizes
+   the remaining signal weights accordingly. (SPEC.md originally said
+   ``0.0``; that biased scores toward zero most of the year because events
+   are sparse. The current convention keeps the score's interpretation
+   stable across event-rich and event-poor windows.)
 2. Compute ``days_until = next_event.start_date - as_of``.
 3. For each **past event of the same kind**, look up the item's daily price at
    ``past_event.start_date - days_until`` (the "start of the comparable
@@ -56,7 +60,8 @@ def compute(conn: sqlite3.Connection, item_id: int, as_of: date) -> Signal:
     """Compute the ``event_proximity`` signal for ``item_id`` as of ``as_of``."""
     next_event = next_event_within(conn, as_of, days_window=_LOOKAHEAD_DAYS)
     if next_event is None:
-        return _null_or_zero(item_id, as_of, value=0.0, metadata={"reason": "no_event_within_60d"})
+        # Convention: no upcoming event → null, not zero. Scoring renormalizes.
+        return _signal_with(item_id, as_of, value=None, metadata={"reason": "no_event_within_60d"})
 
     days_until = (next_event.start_date - as_of).days
     base_metadata: dict[str, object] = {
@@ -152,12 +157,6 @@ def _clip_and_scale(fractional_change: float) -> float:
     """Clip to ``[-0.5, 0.5]`` and scale to ``[-1, 1]``."""
     clipped = max(-_CLIP_LIMIT, min(_CLIP_LIMIT, fractional_change))
     return clipped * 2.0
-
-
-def _null_or_zero(
-    item_id: int, as_of: date, *, value: float | None, metadata: dict[str, object]
-) -> Signal:
-    return _signal_with(item_id, as_of, value=value, metadata=metadata)
 
 
 def _signal_with(

@@ -60,6 +60,33 @@ DELETE FROM signals WHERE computed_for = '2026-05-12';
 dota-deals signals compute --date 2026-05-12
 ```
 
+**Stop any concurrent signals runs before doing this.** The delete and the
+re-run are two separate transactions on two separate connections; a
+``signals compute`` running against the same date in another process can
+interleave with the delete and leave the table in a state that's neither
+"the old result" nor "the new result". v1 doesn't run anything concurrently
+in normal operation — but if you ever set up a scheduler that might fire
+twice (cron + manual rerun, two operators, a stuck previous invocation),
+make sure no other ``signals compute`` is active for the target date
+first. ``ps``, ``pgrep dota-deals``, ``SELECT * FROM runs WHERE kind =
+'signals' AND finished_at IS NULL`` — pick whichever check fits your
+deployment.
+
+If you need a stronger guarantee (e.g., automating the recompute in a
+script), wrap the delete in a SQLite transaction and gate it on the
+absence of running signals rows:
+
+```sql
+BEGIN IMMEDIATE;
+-- Will fail if another writer holds the lock — that's the point.
+DELETE FROM signals WHERE computed_for = '2026-05-12';
+COMMIT;
+```
+
+…then run ``signals compute``. ``BEGIN IMMEDIATE`` acquires a write lock
+immediately rather than deferring; another writer mid-flight will get
+``SQLITE_BUSY`` and the script can back off.
+
 ## Interpreting null values
 
 `metadata_json.reason` tells you which guard rejected the computation:
@@ -72,7 +99,7 @@ dota-deals signals compute --date 2026-05-12
 | `supply_velocity` | `no_listing_history` / `insufficient_history` | Less than 14 days of listing observations. |
 | `supply_velocity` | `too_few_recent_observations` / `too_few_reference_observations` | Fewer than 3 observations to take a median over at one of the two endpoints. |
 | `supply_velocity` | `reference_count_zero` | The "30 days ago" listings count was zero — formula undefined. |
-| `event_proximity` | `no_event_within_60d` | No upcoming event; emits `0.0` (not null). |
+| `event_proximity` | `no_event_within_60d` | No upcoming event within the 60-day window. Returns null so scoring renormalizes the remaining 80% of weight (Phase 5 convention). |
 | `event_proximity` | `no_past_events_of_kind` | First time we've seen this event kind. Common in v1. |
 | `event_proximity` | `insufficient_peers_with_history` | Category fallback couldn't find ≥ 3 peers with past-window data. |
 | `comparables_delta` | `no_current_price` | Item has no `latest_observation` row (never ingested cleanly). |

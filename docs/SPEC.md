@@ -135,7 +135,11 @@ of the item (or its category) in equivalent past windows.
 
 **Formula (plain English).**
 1. Find the next major event (TI, treasure release, major patch). If no event
-   within 60 days, emit 0.0.
+   within 60 days, emit **null** — the signal does not apply right now, and
+   the scoring layer renormalizes the remaining weights. (Earlier drafts of
+   this spec said "emit 0.0"; that biased scores toward zero most of the year
+   since events are sparse. See ``docs/SCORING.md`` for the renormalization
+   math.)
 2. Compute days-until-event.
 3. Look up the item's price behavior (or category-level behavior if item lacks
    history) in the same days-until-event window in past years.

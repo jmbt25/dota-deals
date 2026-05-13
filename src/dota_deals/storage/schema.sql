@@ -96,6 +96,23 @@ CREATE TABLE IF NOT EXISTS signals (
 CREATE INDEX IF NOT EXISTS ix_signals_computed_for ON signals(computed_for);
 CREATE INDEX IF NOT EXISTS ix_signals_name_computed_for ON signals(signal_name, computed_for);
 
+-- Composed buy scores per item per date. components_json stores the four
+-- signal values that fed the score (including nulls); data_quality_json
+-- carries per-score honesty-in-failure flags (null signal names, ingest
+-- status for the date).
+CREATE TABLE IF NOT EXISTS scores (
+    item_id           INTEGER NOT NULL,
+    computed_for      TEXT NOT NULL,                                  -- ISO-8601 date
+    buy_score         REAL NOT NULL CHECK (buy_score >= -1.0 AND buy_score <= 1.0),
+    components_json   TEXT NOT NULL,                                  -- {"price_zscore": 0.5, ...}
+    explanation       TEXT NOT NULL,                                  -- one-line plain English
+    data_quality_json TEXT,                                           -- {"null_signals": [...], ...}
+    PRIMARY KEY (item_id, computed_for),
+    FOREIGN KEY (item_id) REFERENCES items(item_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_scores_computed_for ON scores(computed_for);
+
 -- Records that failed validation. Never silently dropped.
 CREATE TABLE IF NOT EXISTS quarantine (
     quarantine_id  INTEGER PRIMARY KEY AUTOINCREMENT,

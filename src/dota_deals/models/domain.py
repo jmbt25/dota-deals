@@ -77,15 +77,23 @@ class Signal(BaseModel):
 
 
 class BuyScore(BaseModel):
-    """A composite buy score with its component signals exposed."""
+    """A composite buy score with its component signals exposed.
+
+    ``components`` carries every signal value (including nulls) so the
+    display layer can show "we didn't have this one" alongside the active
+    contributors. ``data_quality`` records why those nulls happened plus
+    any run-level context worth surfacing in the per-item view (e.g. the
+    ingest stage for this date was ``partial``).
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     item_id: int
     computed_for: date
-    score: float
+    score: float = Field(ge=-1.0, le=1.0)
     components: dict[SignalName, float | None]
     explanation: str
+    data_quality: dict[str, object] = Field(default_factory=dict)
 
 
 class RunSummary(BaseModel):

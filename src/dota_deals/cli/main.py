@@ -5,7 +5,8 @@ Sub-commands:
 * ``universe refresh`` — refresh the items universe via Steam search.
 * ``ingest``           — fetch current prices/listings for the items in a file.
 * ``signals compute``  — compute all four signals for every active item on a date.
-* (Phase 5) ``score``, ``report``.
+* ``score``            — compose buy scores from signals for a date.
+* ``report``           — render top-N report to stdout or JSON file.
 
 The :data:`app` object is the Typer application; ``[project.scripts]`` in
 ``pyproject.toml`` wires the ``dota-deals`` console script to :func:`main`.
@@ -27,7 +28,15 @@ from dota_deals.ingest.runner import run_ingestion
 from dota_deals.ingest.universe import refresh_universe
 from dota_deals.logging import configure_logging, get_logger
 from dota_deals.models.domain import RunSummary
+from dota_deals.notifier import json_file, stdout
+from dota_deals.scoring.runner import compute_scores_for
 from dota_deals.signals.runner import compute_signals_for
+from dota_deals.storage.db import connect
+from dota_deals.storage.repositories import (
+    items_missing_observation_for_date,
+    latest_ingest_run_for_date,
+    latest_scores,
+)
 
 app = typer.Typer(
     name="dota-deals",
@@ -203,6 +212,109 @@ def signals_compute(
 
     if summary.status == "failed":
         raise typer.Exit(code=1)
+
+
+def _parse_date_or_today(raw: str | None) -> date:
+    if raw is None:
+        return datetime.now(UTC).date()
+    try:
+        return date.fromisoformat(raw)
+    except ValueError as e:
+        raise typer.BadParameter(f"invalid date {raw!r}: {e}") from e
+
+
+def _data_quality_block(settings: Settings, on: date) -> dict[str, object]:
+    """Build the run-level data_quality block used by the notifier."""
+    conn = connect(settings.db_path)
+    try:
+        ingest = latest_ingest_run_for_date(conn, on)
+        missing = items_missing_observation_for_date(conn, on)
+    finally:
+        conn.close()
+    block: dict[str, object] = {}
+    if ingest is None:
+        block["ingest_status"] = "missing"
+    else:
+        block["ingest_run_id"] = ingest[0]
+        block["ingest_status"] = ingest[1]
+    block["missing_items"] = missing
+    return block
+
+
+@app.command("score")
+def score_command(
+    date_str: Annotated[
+        str | None,
+        typer.Option("--date", "-d", help="UTC date YYYY-MM-DD; defaults to today UTC."),
+    ] = None,
+) -> None:
+    """Compose buy scores from signals for the given UTC date."""
+    as_of = _parse_date_or_today(date_str)
+    settings = load_settings()
+    parent_run_id = str(uuid.uuid4())
+    configure_logging(run_id=parent_run_id, log_format=settings.log_format)
+    log = get_logger("dota_deals.cli.score").bind(source="cli", parent_run_id=parent_run_id)
+
+    run_id = str(uuid.uuid4())
+    log.info("starting scoring", as_of=as_of.isoformat())
+    summary: RunSummary = compute_scores_for(
+        as_of=as_of, settings=settings, run_id=run_id, parent_run_id=parent_run_id
+    )
+    log.info(
+        "scoring complete",
+        status=summary.status,
+        items_ok=summary.items_ok,
+        items_failed=summary.items_failed,
+    )
+    if summary.status == "failed":
+        raise typer.Exit(code=1)
+
+
+@app.command("report")
+def report_command(
+    date_str: Annotated[
+        str | None,
+        typer.Option("--date", "-d", help="UTC date YYYY-MM-DD; defaults to today UTC."),
+    ] = None,
+    top: Annotated[
+        int, typer.Option("--top", "-n", help="Number of top candidates to report.")
+    ] = 20,
+    out: Annotated[
+        Path | None,
+        typer.Option(
+            "--out",
+            "-o",
+            help="Write JSON to this path. If omitted, the report goes to stdout.",
+        ),
+    ] = None,
+) -> None:
+    """Render the top-N buy candidates for ``--date`` to stdout or JSON file."""
+    if top < 0:
+        raise typer.BadParameter(f"--top must be >= 0, got {top}")
+    as_of = _parse_date_or_today(date_str)
+    settings = load_settings()
+    parent_run_id = str(uuid.uuid4())
+    configure_logging(run_id=parent_run_id, log_format=settings.log_format)
+    log = get_logger("dota_deals.cli.report").bind(source="cli", parent_run_id=parent_run_id)
+
+    conn = connect(settings.db_path)
+    try:
+        scores = latest_scores(conn, as_of, top)
+    finally:
+        conn.close()
+
+    data_quality = _data_quality_block(settings, as_of)
+
+    if out is None:
+        stdout.emit(scores, data_quality, dest=None)
+    else:
+        json_file.emit(scores, data_quality, dest=out)
+    log.info(
+        "report emitted",
+        as_of=as_of.isoformat(),
+        score_count=len(scores),
+        out=str(out) if out else "stdout",
+    )
 
 
 def main() -> None:

@@ -130,13 +130,16 @@ def test_partial_history_item_still_emits_four_rows_with_nulls(
         "event_proximity",
         "comparables_delta",
     }
-    # Every value is null because no history → all signals emit null
-    # (except event_proximity, which returns 0.0 because no event is in the
-    # 60-day window — that's the documented "doesn't apply" sentinel).
+    # Every signal emits null on a cold-start item: three because of
+    # insufficient data, event_proximity because no event is in the 60-day
+    # window (Phase 5 convention: "doesn't apply" is null, not zero).
     null_signals = {r["signal_name"] for r in rows if r["value"] is None}
-    zero_signals = {r["signal_name"] for r in rows if r["value"] == 0.0}
-    assert null_signals == {"price_zscore", "supply_velocity", "comparables_delta"}
-    assert zero_signals == {"event_proximity"}
+    assert null_signals == {
+        "price_zscore",
+        "supply_velocity",
+        "event_proximity",
+        "comparables_delta",
+    }
 
 
 def test_idempotent_rerun_does_not_double_write(

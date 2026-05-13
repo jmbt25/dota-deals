@@ -45,9 +45,13 @@ from dota_deals.storage.repositories import (
 SignalComputeFn = Callable[[sqlite3.Connection, int, date], Signal]
 
 # Module references rather than direct function references so attribute
-# resolution happens at *call* time; this keeps monkeypatching the signal
-# modules' ``compute`` symbol (in tests, in a future tracing wrapper, etc.)
-# working without surprises.
+# resolution happens at *call* time. Chosen for future signal
+# instrumentation — timing per signal, error rates, fallback frequency, and
+# null-cause distribution are all things we'll want to observe in
+# production. Wrapping ``module.compute`` (replacing it with a decorated
+# version that records metrics, then restoring it) only works when callers
+# resolve the attribute at call time; caching the function reference at
+# import would defeat that.
 _SIGNAL_MODULES: tuple[tuple[SignalName, ModuleType], ...] = (
     ("price_zscore", price_zscore),
     ("supply_velocity", supply_velocity),

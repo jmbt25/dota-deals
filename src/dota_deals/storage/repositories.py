@@ -609,12 +609,147 @@ def signals_for(conn: sqlite3.Connection, item_id: int, on: date) -> list[Signal
     ]
 
 
-# ---- buy_scores (derived; not stored separately yet) ----
+# ---- buy_scores ----
+
+
+def _row_to_buy_score(row: sqlite3.Row) -> BuyScore:
+    return BuyScore(
+        item_id=int(row["item_id"]),
+        computed_for=date.fromisoformat(row["computed_for"]),
+        score=float(row["buy_score"]),
+        components=json.loads(row["components_json"]),
+        explanation=row["explanation"],
+        data_quality=(json.loads(row["data_quality_json"]) if row["data_quality_json"] else {}),
+    )
+
+
+def insert_score(conn: sqlite3.Connection, score: BuyScore) -> bool:
+    """Insert a buy score row. Idempotent via PK ``(item_id, computed_for)``.
+
+    Returns ``True`` if a new row was written, ``False`` on collision.
+    """
+    try:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO scores
+                (item_id, computed_for, buy_score, components_json,
+                 explanation, data_quality_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                score.item_id,
+                score.computed_for.isoformat(),
+                score.score,
+                json.dumps(score.components, sort_keys=True),
+                score.explanation,
+                json.dumps(score.data_quality, sort_keys=True) if score.data_quality else None,
+            ),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        raise IntegrityViolation(f"scores insert failed for item_id={score.item_id}: {e}") from e
+    except sqlite3.Error as e:
+        raise StorageError(f"scores insert failed: {e}") from e
+    return cursor.rowcount > 0
+
+
+def scores_for(conn: sqlite3.Connection, on: date) -> list[BuyScore]:
+    """Return every score row for the given UTC date, ordered by item_id.
+
+    Used by the notifier to read back what was written, and by debug
+    queries. Apply :func:`dota_deals.scoring.buy_score.rank_top_n` to sort
+    by score.
+    """
+    try:
+        rows = conn.execute(
+            """
+            SELECT item_id, computed_for, buy_score, components_json,
+                   explanation, data_quality_json
+            FROM scores
+            WHERE computed_for = ?
+            ORDER BY item_id
+            """,
+            (on.isoformat(),),
+        ).fetchall()
+    except sqlite3.Error as e:
+        raise StorageError(f"scores_for query failed for on={on.isoformat()}: {e}") from e
+    return [_row_to_buy_score(row) for row in rows]
 
 
 def latest_scores(conn: sqlite3.Connection, on: date, limit: int) -> list[BuyScore]:
-    """Return the top ``limit`` :class:`BuyScore` values for ``on``."""
-    raise NotImplementedError
+    """Return the top ``limit`` scores for ``on``, ranked by ``buy_score`` desc.
+
+    Tie-breaker is ``item_id`` ascending for deterministic ordering.
+    """
+    if limit < 0:
+        raise ValueError(f"limit must be >= 0, got {limit}")
+    try:
+        rows = conn.execute(
+            """
+            SELECT item_id, computed_for, buy_score, components_json,
+                   explanation, data_quality_json
+            FROM scores
+            WHERE computed_for = ?
+            ORDER BY buy_score DESC, item_id ASC
+            LIMIT ?
+            """,
+            (on.isoformat(), limit),
+        ).fetchall()
+    except sqlite3.Error as e:
+        raise StorageError(f"latest_scores query failed: {e}") from e
+    return [_row_to_buy_score(row) for row in rows]
+
+
+def latest_ingest_run_for_date(conn: sqlite3.Connection, on: date) -> tuple[str, RunStatus] | None:
+    """Return ``(run_id, status)`` for the most recent ingest run whose
+    ``started_at`` falls on the given UTC date, or ``None`` if no ingest
+    has run on that date.
+
+    Used by the scoring stage to propagate ingest data-quality into the
+    per-score ``data_quality_json``.
+    """
+    try:
+        row = conn.execute(
+            """
+            SELECT run_id, status
+            FROM runs
+            WHERE kind = 'ingest'
+              AND date(started_at) = ?
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            (on.isoformat(),),
+        ).fetchone()
+    except sqlite3.Error as e:
+        raise StorageError(f"latest_ingest_run_for_date failed: {e}") from e
+    if row is None:
+        return None
+    return (str(row["run_id"]), row["status"])
+
+
+def items_missing_observation_for_date(conn: sqlite3.Connection, on: date) -> list[str]:
+    """Return ``market_hash`` for every active item that has no
+    ``price_history`` row on ``on``. Used to surface "what ingest missed".
+    """
+    try:
+        rows = conn.execute(
+            """
+            SELECT i.market_hash
+            FROM items i
+            WHERE i.active = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM price_history p
+                  WHERE p.item_id = i.item_id AND date(p.observed_at) = ?
+              )
+            ORDER BY i.market_hash
+            """,
+            (on.isoformat(),),
+        ).fetchall()
+    except sqlite3.Error as e:
+        raise StorageError(
+            f"items_missing_observation_for_date failed for on={on.isoformat()}: {e}"
+        ) from e
+    return [str(row["market_hash"]) for row in rows]
 
 
 # ---- quarantine ----

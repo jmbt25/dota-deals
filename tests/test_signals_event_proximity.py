@@ -56,14 +56,20 @@ def _insert_event(
 # ----------------------------- tests -------------------------------------------
 
 
-def test_no_event_within_60_days_returns_zero(db_conn: sqlite3.Connection) -> None:
-    """SPEC: no event in the 60-day lookahead → 0.0 (signal "doesn't apply")."""
+def test_no_event_within_60_days_returns_null(db_conn: sqlite3.Connection) -> None:
+    """No event in the 60-day lookahead → null (signal does not apply).
+
+    The convention changed in Phase 5 from ``0.0`` to ``None`` so the
+    scoring layer's renormalization picks up the slack (otherwise the 20%
+    weight reserved for event_proximity would silently cap most-of-the-year
+    scores at 0.80). See SPEC.md and docs/SCORING.md.
+    """
     item_id = insert_test_item(db_conn, market_hash="X", category="arcana")
     _insert_event(db_conn, start_date=AS_OF + timedelta(days=120))  # far future
     db_conn.commit()
 
     signal = event_proximity.compute(db_conn, item_id, AS_OF)
-    assert signal.value == 0.0
+    assert signal.value is None
     assert signal.metadata["reason"] == "no_event_within_60d"
 
 
@@ -173,6 +179,8 @@ def test_no_past_events_of_kind_returns_null(db_conn: sqlite3.Connection) -> Non
 
 
 def test_returned_signal_carries_correct_metadata(db_conn: sqlite3.Connection) -> None:
+    """The Signal dataclass fields are populated correctly even on the
+    no-event null path."""
     item_id = insert_test_item(db_conn, market_hash="X", category="arcana")
     _insert_event(db_conn, start_date=AS_OF + timedelta(days=120))
     db_conn.commit()
@@ -182,3 +190,4 @@ def test_returned_signal_carries_correct_metadata(db_conn: sqlite3.Connection) -
     assert signal.signal_name == "event_proximity"
     assert signal.computed_for == AS_OF
     assert signal.item_id == item_id
+    assert signal.value is None  # no event within 60 days
