@@ -49,12 +49,15 @@ from dota_deals.storage.d1_client import (
 )
 
 
-class _D1Backend(Protocol):
+class D1Backend(Protocol):
     """Common surface for :class:`D1Client` and ``D1FakeClient``.
 
     Defined as a Protocol so the connection wrapper can accept either
     the real HTTP client or the in-memory test fake without an
-    ``isinstance`` dance.
+    ``isinstance`` dance. Exposed publicly so runners (e.g.
+    :mod:`dota_deals.ingest.runner`) can declare an optional
+    ``backend`` parameter as their test seam without importing the
+    fake into production code.
     """
 
     async def __aenter__(self) -> Self: ...
@@ -88,7 +91,7 @@ class D1Connection:
 
     def __init__(
         self,
-        backend: _D1Backend,
+        backend: D1Backend,
         *,
         budget_warn: int,
         logger: BoundLogger | None = None,
@@ -169,7 +172,7 @@ class D1Connection:
 async def connect(
     settings: Settings,
     *,
-    backend: _D1Backend | None = None,
+    backend: D1Backend | None = None,
 ) -> AsyncIterator[D1Connection]:
     """Yield a :class:`D1Connection` bound to a D1 backend.
 

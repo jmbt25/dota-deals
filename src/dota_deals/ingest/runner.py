@@ -5,6 +5,12 @@ validates each response, persists valid records to ``price_history`` /
 ``listing_history`` / ``latest_observation``, routes validation failures to
 ``quarantine``, and writes a single row to ``runs`` summarizing the outcome.
 
+Phase 9c-i note: storage was moved from local SQLite to Cloudflare D1
+over HTTP. The runner now opens a :class:`D1Connection` via
+:func:`dota_deals.storage.db_async.connect` and dispatches to
+:mod:`dota_deals.storage.repositories_async`. The Steam-side concurrency
+model and slot-truncation semantics are unchanged from Phase 3.
+
 Observed-at semantics
 ---------------------
 Every successful poll within a single CLI invocation writes its observations
@@ -17,7 +23,6 @@ re-run within the same slot is a no-op rather than a duplicate write.
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
@@ -32,8 +37,8 @@ from dota_deals.ingest.steam import (
 )
 from dota_deals.logging import get_logger
 from dota_deals.models.domain import ListingPoint, PricePoint, RunStatus, RunSummary
-from dota_deals.storage.db import bootstrap_schema, connect
-from dota_deals.storage.repositories import (
+from dota_deals.storage.db_async import D1Backend, D1Connection, connect
+from dota_deals.storage.repositories_async import (
     get_item_by_hash,
     increment_ingest_strikes,
     insert_listing_point,
@@ -82,6 +87,7 @@ async def run_ingestion(
     run_id: str,
     parent_run_id: str | None = None,
     now: datetime | None = None,
+    backend: D1Backend | None = None,
 ) -> RunSummary:
     """Ingest current price and listing data for every item in ``items``.
 
@@ -92,14 +98,17 @@ async def run_ingestion(
     :param items: list of Steam ``market_hash_name`` values to fetch. Items
         absent from the ``items`` table count as failures (the universe stage
         is responsible for populating that table).
-    :param settings: process settings (concurrency, timeouts, cool-down, DB
-        path, cadence).
+    :param settings: process settings (concurrency, timeouts, cool-down, D1
+        credentials, cadence).
     :param run_id: UUID4 identifying this ingestion run.
     :param parent_run_id: optional UUID4 grouping this run with sibling stage
         runs from the same CLI invocation.
     :param now: optional override for the run's wall-clock time; tests use
         this to control polling-slot truncation. Defaults to
         ``datetime.now(UTC)``.
+    :param backend: test seam. When ``None`` (CLI path), the runner opens a
+        real :class:`D1Client` from ``settings``. Tests pass a
+        :class:`D1FakeClient` instance to keep the storage in-memory.
     """
     started_at = now if now is not None else datetime.now(UTC)
     observed_at = slot_for(started_at, settings.ingest_cadence_hours)
@@ -110,10 +119,8 @@ async def run_ingestion(
         observed_at=observed_at.isoformat(),
     )
 
-    conn = connect(settings.db_path)
-    try:
-        bootstrap_schema(conn)
-        insert_run(
+    async with connect(settings, backend=backend) as conn:
+        await insert_run(
             conn,
             RunSummary(
                 run_id=run_id,
@@ -151,7 +158,7 @@ async def run_ingestion(
             "success" if items_quarantined == 0 and items_failed == 0 else "partial"
         )
         finished_at = datetime.now(UTC)
-        update_run(
+        await update_run(
             conn,
             run_id,
             status=final_status,
@@ -180,14 +187,12 @@ async def run_ingestion(
             items_failed=items_failed,
             notes=None,
         )
-    finally:
-        conn.close()
 
 
 async def _ingest_one(
     *,
     client: SteamMarketClient,
-    conn: sqlite3.Connection,
+    conn: D1Connection,
     item_hash: str,
     observed_at: datetime,
     run_id: str,
@@ -195,7 +200,7 @@ async def _ingest_one(
 ) -> _ItemResult:
     item_log = log.bind(item_hash=item_hash)
 
-    item = get_item_by_hash(conn, item_hash)
+    item = await get_item_by_hash(conn, item_hash)
     if item is None:
         item_log.warning(
             "item not in items table, counting as failed",
@@ -206,7 +211,7 @@ async def _ingest_one(
     try:
         overview = await client.fetch_price_overview(item_hash)
     except IngestValidationError as ve:
-        quarantine_record(
+        await quarantine_record(
             conn,
             run_id=run_id,
             source=ve.source,
@@ -223,13 +228,13 @@ async def _ingest_one(
             status_code=ie.status_code,
             error=str(ie),
         )
-        _record_failure_strike(conn, item.item_id, item.active, ie.status_code, item_log)
+        await _record_failure_strike(conn, item.item_id, item.active, ie.status_code, item_log)
         return _ItemResult(outcome="failed", item_hash=item_hash)
 
     try:
         listings = await client.fetch_listings(item_hash)
     except IngestValidationError as ve:
-        quarantine_record(
+        await quarantine_record(
             conn,
             run_id=run_id,
             source=ve.source,
@@ -246,7 +251,7 @@ async def _ingest_one(
             status_code=ie.status_code,
             error=str(ie),
         )
-        _record_failure_strike(conn, item.item_id, item.active, ie.status_code, item_log)
+        await _record_failure_strike(conn, item.item_id, item.active, ie.status_code, item_log)
         return _ItemResult(outcome="failed", item_hash=item_hash)
 
     # Steam returned 200s but item may not have prices yet (newly listed).
@@ -274,21 +279,21 @@ async def _ingest_one(
         listings_count=listings.listings_count,
     )
 
-    insert_price_point(conn, price_point)
-    insert_listing_point(conn, listing_point)
-    upsert_latest_observation(conn, price_point, listing_point.listings_count)
+    await insert_price_point(conn, price_point)
+    await insert_listing_point(conn, listing_point)
+    await upsert_latest_observation(conn, price_point, listing_point.listings_count)
 
     # A successful poll clears any in-flight strikes. Reactivation is the
     # universe stage's job (per docs/ARCHITECTURE.md); ingest only clears the
     # counter so a future 4xx run restarts from zero.
     if item.consecutive_ingest_4xx > 0:
-        reset_ingest_strikes(conn, item.item_id)
+        await reset_ingest_strikes(conn, item.item_id)
 
     return _ItemResult(outcome="ok", item_hash=item_hash)
 
 
-def _record_failure_strike(
-    conn: sqlite3.Connection,
+async def _record_failure_strike(
+    conn: D1Connection,
     item_id: int,
     item_active: bool,
     status_code: int | None,
@@ -305,9 +310,9 @@ def _record_failure_strike(
     """
     if status_code is None or not (400 <= status_code < 500) or status_code == 429:
         return
-    new_count = increment_ingest_strikes(conn, item_id)
+    new_count = await increment_ingest_strikes(conn, item_id)
     if new_count >= _INGEST_DEACTIVATION_THRESHOLD and item_active:
-        set_item_active(conn, item_id, active=False)
+        await set_item_active(conn, item_id, active=False)
         item_log.warning(
             "item deactivated after consecutive 4xx",
             strike_count=new_count,

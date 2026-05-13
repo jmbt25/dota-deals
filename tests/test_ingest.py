@@ -13,30 +13,36 @@ Covers the seven cases enumerated in the Phase 3 brief:
 Steam-client-level retry behaviors (cases 2, 3, 4 in part) are tested against
 the client directly with a recording sleep so retries don't burn wall-clock
 time. Runner-level concerns (cases 1, 4 partial, 5, 6, 7) drive the full
-:func:`run_ingestion` orchestration with respx-mocked HTTP and the real
-SQLite repositories.
+:func:`run_ingestion` orchestration with respx-mocked HTTP and an in-memory
+D1 fake.
+
+Phase 9c-i note: storage assertions now go through
+:class:`D1Connection.query` (returning dict rows) rather than raw sqlite3.
+The Steam-side tests are untouched — the client doesn't know about storage.
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
-import sqlite3
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 import pytest
 import respx
 
 from dota_deals.config import Settings
-from dota_deals.ingest.runner import run_ingestion, slot_for
+from dota_deals.ingest.runner import _record_failure_strike, run_ingestion, slot_for
 from dota_deals.ingest.steam import (
     IngestError,
     IngestValidationError,
     SteamMarketClient,
 )
-from tests.conftest import insert_test_item
+from dota_deals.storage.db_async import D1Connection
+from tests._d1_fake import D1FakeClient
+from tests.conftest import insert_test_item_async
 
 PRICE_OVERVIEW = "https://steamcommunity.com/market/priceoverview/"
 LISTINGS_PATTERN = re.compile(r"https://steamcommunity\.com/market/listings/570/[^/]+/render")
@@ -81,6 +87,24 @@ def _make_recorded_sleep() -> tuple[Callable[[float], Awaitable[None]], list[flo
         await asyncio.sleep(0)
 
     return fake_sleep, calls
+
+
+async def _select(
+    conn: D1Connection, sql: str, params: tuple[Any, ...] = ()
+) -> list[dict[str, Any]]:
+    """Tiny wrapper for terse one-liner assertions in tests.
+
+    Returns the result rows directly so call sites can write
+    ``rows = await _select(conn, "SELECT ...")`` without juggling
+    :class:`D1Result` envelopes.
+    """
+    result = await conn.query(sql, params)
+    return result.results
+
+
+async def _count(conn: D1Connection, table: str) -> int:
+    rows = await _select(conn, f"SELECT count(*) AS n FROM {table}")
+    return int(rows[0]["n"])
 
 
 # ----------------------------- slot truncation ---------------------------------
@@ -210,10 +234,14 @@ async def test_client_5xx_retried(settings: Settings) -> None:
 
 
 @pytest.mark.asyncio
-async def test_runner_happy_path(settings: Settings, db_conn: sqlite3.Connection) -> None:
+async def test_runner_happy_path(
+    settings: Settings,
+    db_conn_async: tuple[D1Connection, D1FakeClient],
+) -> None:
     """Case 1: happy path persists rows in price_history + listing_history."""
-    item_id = insert_test_item(
-        db_conn, market_hash="Inscribed Manifold Paradox", hero="Phantom Assassin"
+    conn, fake = db_conn_async
+    item_id = await insert_test_item_async(
+        conn, market_hash="Inscribed Manifold Paradox", hero="Phantom Assassin"
     )
 
     with respx.mock(assert_all_called=False) as router:
@@ -226,6 +254,7 @@ async def test_runner_happy_path(settings: Settings, db_conn: sqlite3.Connection
             run_id="run-1",
             parent_run_id="parent-1",
             now=FIXED_NOW,
+            backend=fake,
         )
 
     assert summary.status == "success"
@@ -233,9 +262,7 @@ async def test_runner_happy_path(settings: Settings, db_conn: sqlite3.Connection
     assert summary.items_quarantined == 0
     assert summary.items_failed == 0
 
-    price_rows = db_conn.execute(
-        "SELECT * FROM price_history ORDER BY item_id, observed_at"
-    ).fetchall()
+    price_rows = await _select(conn, "SELECT * FROM price_history ORDER BY item_id, observed_at")
     assert len(price_rows) == 1
     assert price_rows[0]["item_id"] == item_id
     assert price_rows[0]["observed_at"] == EXPECTED_OBSERVED_AT.isoformat()
@@ -243,25 +270,29 @@ async def test_runner_happy_path(settings: Settings, db_conn: sqlite3.Connection
     assert price_rows[0]["median_cents"] == 349
     assert price_rows[0]["volume_24h"] == 12
 
-    listing_rows = db_conn.execute("SELECT * FROM listing_history").fetchall()
+    listing_rows = await _select(conn, "SELECT * FROM listing_history")
     assert len(listing_rows) == 1
     assert listing_rows[0]["listings_count"] == 27
 
-    latest = db_conn.execute("SELECT * FROM latest_observation").fetchone()
-    assert latest["lowest_cents"] == 345
-    assert latest["listings_count"] == 27
+    latest_rows = await _select(conn, "SELECT * FROM latest_observation")
+    assert latest_rows[0]["lowest_cents"] == 345
+    assert latest_rows[0]["listings_count"] == 27
 
-    run = db_conn.execute("SELECT * FROM runs WHERE run_id = ?", ("run-1",)).fetchone()
-    assert run["status"] == "success"
-    assert run["parent_run_id"] == "parent-1"
-    assert run["items_ok"] == 1
+    run_rows = await _select(conn, "SELECT * FROM runs WHERE run_id = ?", ("run-1",))
+    assert run_rows[0]["status"] == "success"
+    assert run_rows[0]["parent_run_id"] == "parent-1"
+    assert run_rows[0]["items_ok"] == 1
 
 
 @pytest.mark.asyncio
-async def test_runner_4xx_run_continues(settings: Settings, db_conn: sqlite3.Connection) -> None:
+async def test_runner_4xx_run_continues(
+    settings: Settings,
+    db_conn_async: tuple[D1Connection, D1FakeClient],
+) -> None:
     """Case 4 (runner level): a 4xx on one item doesn't abort the run."""
-    insert_test_item(db_conn, market_hash="GOOD")
-    insert_test_item(db_conn, market_hash="BAD")
+    conn, fake = db_conn_async
+    await insert_test_item_async(conn, market_hash="GOOD")
+    await insert_test_item_async(conn, market_hash="BAD")
 
     def route_overview(request: httpx.Request) -> httpx.Response:
         name = request.url.params.get("market_hash_name", "")
@@ -278,21 +309,24 @@ async def test_runner_4xx_run_continues(settings: Settings, db_conn: sqlite3.Con
             settings=settings,
             run_id="run-2",
             now=FIXED_NOW,
+            backend=fake,
         )
 
     assert summary.items_ok == 1
     assert summary.items_failed == 1
     assert summary.status == "partial"
     # The good item still persisted.
-    assert db_conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0] == 1
+    assert await _count(conn, "price_history") == 1
 
 
 @pytest.mark.asyncio
 async def test_runner_validation_routes_to_quarantine(
-    settings: Settings, db_conn: sqlite3.Connection
+    settings: Settings,
+    db_conn_async: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 5: bad payload lands in quarantine, not price_history."""
-    insert_test_item(db_conn, market_hash="X")
+    conn, fake = db_conn_async
+    await insert_test_item_async(conn, market_hash="X")
 
     bad = {
         "success": True,
@@ -305,13 +339,19 @@ async def test_runner_validation_routes_to_quarantine(
         router.get(PRICE_OVERVIEW).mock(return_value=httpx.Response(200, json=bad))
         router.get(LISTINGS_PATTERN).mock(return_value=_ok_listings(27))
 
-        summary = await run_ingestion(items=["X"], settings=settings, run_id="run-3", now=FIXED_NOW)
+        summary = await run_ingestion(
+            items=["X"],
+            settings=settings,
+            run_id="run-3",
+            now=FIXED_NOW,
+            backend=fake,
+        )
 
     assert summary.items_quarantined == 1
     assert summary.items_ok == 0
 
-    assert db_conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0] == 0
-    q_rows = db_conn.execute("SELECT * FROM quarantine").fetchall()
+    assert await _count(conn, "price_history") == 0
+    q_rows = await _select(conn, "SELECT * FROM quarantine")
     assert len(q_rows) == 1
     assert "totally_not_a_price" in q_rows[0]["raw_payload"]
     assert q_rows[0]["source"] == "steam_price_overview"
@@ -321,37 +361,49 @@ async def test_runner_validation_routes_to_quarantine(
 
 @pytest.mark.asyncio
 async def test_runner_idempotent_double_run(
-    settings: Settings, db_conn: sqlite3.Connection
+    settings: Settings,
+    db_conn_async: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 6: two runs at the same polling slot produce one row each."""
-    insert_test_item(db_conn, market_hash="X")
+    conn, fake = db_conn_async
+    await insert_test_item_async(conn, market_hash="X")
 
     with respx.mock(assert_all_called=False) as router:
         router.get(PRICE_OVERVIEW).mock(return_value=_ok_priceoverview())
         router.get(LISTINGS_PATTERN).mock(return_value=_ok_listings(27))
 
-        s1 = await run_ingestion(items=["X"], settings=settings, run_id="r-a", now=FIXED_NOW)
+        s1 = await run_ingestion(
+            items=["X"], settings=settings, run_id="r-a", now=FIXED_NOW, backend=fake
+        )
         # Different wall-clock minute, same polling slot.
         same_slot_later = FIXED_NOW.replace(minute=59)
-        s2 = await run_ingestion(items=["X"], settings=settings, run_id="r-b", now=same_slot_later)
+        s2 = await run_ingestion(
+            items=["X"],
+            settings=settings,
+            run_id="r-b",
+            now=same_slot_later,
+            backend=fake,
+        )
 
     assert s1.items_ok == 1
     assert s2.items_ok == 1
 
-    assert db_conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0] == 1
-    assert db_conn.execute("SELECT COUNT(*) FROM listing_history").fetchone()[0] == 1
-    assert db_conn.execute("SELECT COUNT(*) FROM latest_observation").fetchone()[0] == 1
+    assert await _count(conn, "price_history") == 1
+    assert await _count(conn, "listing_history") == 1
+    assert await _count(conn, "latest_observation") == 1
     # Both runs recorded.
-    assert db_conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 2
+    assert await _count(conn, "runs") == 2
 
 
 @pytest.mark.asyncio
 async def test_runner_summary_reflects_mixed_outcomes(
-    settings: Settings, db_conn: sqlite3.Connection
+    settings: Settings,
+    db_conn_async: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 7: runs table records ok / quarantined / failed counts faithfully."""
-    insert_test_item(db_conn, market_hash="OK_ITEM")
-    insert_test_item(db_conn, market_hash="BAD_ITEM")
+    conn, fake = db_conn_async
+    await insert_test_item_async(conn, market_hash="OK_ITEM")
+    await insert_test_item_async(conn, market_hash="BAD_ITEM")
     # UNKNOWN_ITEM intentionally not in the items table.
 
     def route_overview(request: httpx.Request) -> httpx.Response:
@@ -371,6 +423,7 @@ async def test_runner_summary_reflects_mixed_outcomes(
             settings=settings,
             run_id="run-mixed",
             now=FIXED_NOW,
+            backend=fake,
         )
 
     assert summary.items_ok == 1
@@ -378,12 +431,12 @@ async def test_runner_summary_reflects_mixed_outcomes(
     assert summary.items_failed == 1
     assert summary.status == "partial"
 
-    run = db_conn.execute("SELECT * FROM runs WHERE run_id = ?", ("run-mixed",)).fetchone()
-    assert run["status"] == "partial"
-    assert run["items_ok"] == 1
-    assert run["items_quarantined"] == 1
-    assert run["items_failed"] == 1
-    assert run["finished_at"] is not None
+    run_rows = await _select(conn, "SELECT * FROM runs WHERE run_id = ?", ("run-mixed",))
+    assert run_rows[0]["status"] == "partial"
+    assert run_rows[0]["items_ok"] == 1
+    assert run_rows[0]["items_quarantined"] == 1
+    assert run_rows[0]["items_failed"] == 1
+    assert run_rows[0]["finished_at"] is not None
 
 
 # ----------------------------- 3-strike deactivation ---------------------------
@@ -391,63 +444,83 @@ async def test_runner_summary_reflects_mixed_outcomes(
 
 @pytest.mark.asyncio
 async def test_deactivation_fires_at_exactly_three_strikes(
-    settings: Settings, db_conn: sqlite3.Connection
+    settings: Settings,
+    db_conn_async: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Phase 4a: 3 consecutive 4xx flips items.active = 0. Not at 2, not at 4."""
-    insert_test_item(db_conn, market_hash="X")
+    conn, fake = db_conn_async
+    await insert_test_item_async(conn, market_hash="X")
 
-    def _state() -> tuple[int, int]:
-        row = db_conn.execute(
+    async def _state() -> tuple[int, int]:
+        rows = await _select(
+            conn,
             "SELECT active, consecutive_ingest_4xx FROM items WHERE market_hash = ?",
             ("X",),
-        ).fetchone()
-        return int(row["active"]), int(row["consecutive_ingest_4xx"])
+        )
+        return int(rows[0]["active"]), int(rows[0]["consecutive_ingest_4xx"])
 
     with respx.mock(assert_all_called=False) as router:
         router.get(PRICE_OVERVIEW).mock(return_value=httpx.Response(404))
 
         # Strike 1
-        await run_ingestion(items=["X"], settings=settings, run_id="r1", now=FIXED_NOW)
-        assert _state() == (1, 1), "after strike 1: still active, count=1"
+        await run_ingestion(
+            items=["X"], settings=settings, run_id="r1", now=FIXED_NOW, backend=fake
+        )
+        assert await _state() == (1, 1), "after strike 1: still active, count=1"
 
         # Strike 2
-        await run_ingestion(items=["X"], settings=settings, run_id="r2", now=FIXED_NOW)
-        assert _state() == (1, 2), "after strike 2: still active, count=2"
+        await run_ingestion(
+            items=["X"], settings=settings, run_id="r2", now=FIXED_NOW, backend=fake
+        )
+        assert await _state() == (1, 2), "after strike 2: still active, count=2"
 
         # Strike 3 — deactivation triggers here, not earlier.
-        await run_ingestion(items=["X"], settings=settings, run_id="r3", now=FIXED_NOW)
-        assert _state() == (0, 3), "after strike 3: deactivated, count=3"
+        await run_ingestion(
+            items=["X"], settings=settings, run_id="r3", now=FIXED_NOW, backend=fake
+        )
+        assert await _state() == (0, 3), "after strike 3: deactivated, count=3"
 
         # Strike 4 — counter keeps climbing but active stays 0 (no re-deactivation).
-        await run_ingestion(items=["X"], settings=settings, run_id="r4", now=FIXED_NOW)
-        assert _state() == (0, 4), "after strike 4: still deactivated, count=4"
+        await run_ingestion(
+            items=["X"], settings=settings, run_id="r4", now=FIXED_NOW, backend=fake
+        )
+        assert await _state() == (0, 4), "after strike 4: still deactivated, count=4"
 
 
 @pytest.mark.asyncio
 async def test_strike_counter_reset_on_success(
-    settings: Settings, db_conn: sqlite3.Connection
+    settings: Settings,
+    db_conn_async: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """A successful ingest run clears any accumulated strikes."""
-    insert_test_item(db_conn, market_hash="X")
+    conn, fake = db_conn_async
+    await insert_test_item_async(conn, market_hash="X")
     # Pre-seed two strikes so a third would deactivate.
-    db_conn.execute("UPDATE items SET consecutive_ingest_4xx = 2 WHERE market_hash = ?", ("X",))
-    db_conn.commit()
+    await conn.execute(
+        "UPDATE items SET consecutive_ingest_4xx = 2 WHERE market_hash = ?",
+        ("X",),
+    )
 
     with respx.mock(assert_all_called=False) as router:
         router.get(PRICE_OVERVIEW).mock(return_value=_ok_priceoverview())
         router.get(LISTINGS_PATTERN).mock(return_value=_ok_listings(27))
 
-        await run_ingestion(items=["X"], settings=settings, run_id="r-ok", now=FIXED_NOW)
+        await run_ingestion(
+            items=["X"], settings=settings, run_id="r-ok", now=FIXED_NOW, backend=fake
+        )
 
-    row = db_conn.execute(
-        "SELECT active, consecutive_ingest_4xx FROM items WHERE market_hash = ?", ("X",)
-    ).fetchone()
-    assert row["active"] == 1
-    assert row["consecutive_ingest_4xx"] == 0
+    rows = await _select(
+        conn,
+        "SELECT active, consecutive_ingest_4xx FROM items WHERE market_hash = ?",
+        ("X",),
+    )
+    assert rows[0]["active"] == 1
+    assert rows[0]["consecutive_ingest_4xx"] == 0
 
 
-def test_non_4xx_failures_do_not_count_as_strikes(
-    db_conn: sqlite3.Connection,
+@pytest.mark.asyncio
+async def test_non_4xx_failures_do_not_count_as_strikes(
+    db_conn_async: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Only true 4xx (not 429, not 5xx, not timeouts) increment the strike counter.
 
@@ -456,29 +529,27 @@ def test_non_4xx_failures_do_not_count_as_strikes(
     retry waits at runner level. The strike-policy contract is a small,
     standalone branch worth testing in isolation.
     """
-    from dota_deals.ingest.runner import _record_failure_strike
     from dota_deals.logging import get_logger
 
-    insert_test_item(db_conn, market_hash="X")
-    row = db_conn.execute("SELECT item_id FROM items WHERE market_hash = ?", ("X",)).fetchone()
-    item_id = int(row["item_id"])
+    conn, _fake = db_conn_async
+    item_id = await insert_test_item_async(conn, market_hash="X")
     log = get_logger("test").bind()
 
     for status_code in (429, None, 503, 500, 502):
-        _record_failure_strike(db_conn, item_id, True, status_code, log)
+        await _record_failure_strike(conn, item_id, True, status_code, log)
 
-    assert (
-        db_conn.execute(
-            "SELECT consecutive_ingest_4xx FROM items WHERE market_hash = ?", ("X",)
-        ).fetchone()["consecutive_ingest_4xx"]
-        == 0
-    ), "429/timeout/5xx must not increment strikes"
+    rows = await _select(
+        conn,
+        "SELECT consecutive_ingest_4xx FROM items WHERE market_hash = ?",
+        ("X",),
+    )
+    assert rows[0]["consecutive_ingest_4xx"] == 0, "429/timeout/5xx must not increment strikes"
 
     # Sanity: a true 4xx does increment.
-    _record_failure_strike(db_conn, item_id, True, 404, log)
-    assert (
-        db_conn.execute(
-            "SELECT consecutive_ingest_4xx FROM items WHERE market_hash = ?", ("X",)
-        ).fetchone()["consecutive_ingest_4xx"]
-        == 1
+    await _record_failure_strike(conn, item_id, True, 404, log)
+    rows = await _select(
+        conn,
+        "SELECT consecutive_ingest_4xx FROM items WHERE market_hash = ?",
+        ("X",),
     )
+    assert rows[0]["consecutive_ingest_4xx"] == 1
