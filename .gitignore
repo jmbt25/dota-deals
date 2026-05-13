@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# dota-deals
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+data/
+out/
+
