@@ -2,27 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
 import sqlite3
-from collections.abc import Generator, Iterator
+from collections.abc import Generator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-
-@pytest.fixture()
-def event_loop() -> Iterator[asyncio.AbstractEventLoop]:
-    """Provide a fresh asyncio event loop per test.
-
-    pytest-asyncio in ``auto`` mode supplies its own loop by default, but some
-    tests want explicit control (e.g. to drive a long-running task and observe
-    cancellation).
-    """
-    loop = asyncio.new_event_loop()
-    try:
-        yield loop
-    finally:
-        loop.close()
+from dota_deals.config import Settings
 
 
 @pytest.fixture()
@@ -53,3 +40,47 @@ def db_conn(db_path: Path) -> Generator[sqlite3.Connection, None, None]:
         yield conn
     finally:
         conn.close()
+
+
+@pytest.fixture()
+def settings(db_path: Path) -> Settings:
+    """Test-flavored Settings.
+
+    Tight timeouts and a tiny 429 cool-down keep retries from blocking tests
+    that don't override sleep behavior explicitly.
+    """
+    return Settings(
+        db_path=db_path,
+        steam_concurrency=2,
+        request_timeout_s=2.0,
+        cooldown_429_s=0.01,
+        ingest_cadence_hours=8,
+        steam_currency_id=1,
+        steam_country="US",
+        log_format="console",
+    )
+
+
+def insert_test_item(
+    conn: sqlite3.Connection,
+    *,
+    market_hash: str,
+    name: str | None = None,
+    category: str = "arcana",
+    hero: str | None = None,
+    first_seen_at: datetime | None = None,
+) -> int:
+    """Insert a row into ``items`` and return the resolved ``item_id``.
+
+    Test helper — most ingest tests need a couple of pre-populated items.
+    """
+    seen_at = (first_seen_at or datetime.now(UTC)).isoformat()
+    cursor = conn.execute(
+        """
+        INSERT INTO items (market_hash, name, category, hero, first_seen_at, active)
+        VALUES (?, ?, ?, ?, ?, 1)
+        """,
+        (market_hash, name or market_hash, category, hero, seen_at),
+    )
+    conn.commit()
+    return int(cursor.lastrowid or 0)

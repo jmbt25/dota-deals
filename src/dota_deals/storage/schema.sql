@@ -19,7 +19,7 @@ CREATE INDEX IF NOT EXISTS ix_items_hero ON items(hero);
 -- Per-poll price observations. All prices are INTEGER cents (USD).
 CREATE TABLE IF NOT EXISTS price_history (
     item_id        INTEGER NOT NULL,
-    observed_at    TEXT NOT NULL,                                  -- ISO-8601 UTC, truncated to the hour
+    observed_at    TEXT NOT NULL,                                  -- ISO-8601 UTC, truncated to the polling slot
     lowest_cents   INTEGER NOT NULL CHECK (lowest_cents > 0),
     median_cents   INTEGER CHECK (median_cents IS NULL OR median_cents > 0),
     volume_24h     INTEGER CHECK (volume_24h IS NULL OR volume_24h >= 0),

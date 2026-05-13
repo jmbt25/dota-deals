@@ -7,19 +7,21 @@ module reads ``os.environ`` directly.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-LogFormat = Literal["console", "json"]
+type LogFormat = Literal["console", "json"]
 
 
 class Settings(BaseSettings):
     """Runtime configuration loaded from ``.env`` and the process environment.
 
     Defaults match the values documented in ``docs/ARCHITECTURE.md`` and
-    ``.env.example``. Field-level validators enforce reasonable ranges.
+    ``.env.example``. Field-level validators enforce reasonable ranges; a
+    model-level validator enforces that the ingest cadence divides 24 evenly
+    so polling slots align to a fixed pattern within a UTC day.
     """
 
     model_config = SettingsConfigDict(
@@ -41,6 +43,16 @@ class Settings(BaseSettings):
 
     log_format: LogFormat = Field(default="console")
 
+    @model_validator(mode="after")
+    def _check_cadence_divides_day(self) -> Self:
+        """Polling slots must align to a fixed pattern within a UTC day."""
+        if 24 % self.ingest_cadence_hours != 0:
+            raise ValueError(
+                f"ingest_cadence_hours={self.ingest_cadence_hours} does not divide "
+                "24 evenly; pick one of 1, 2, 3, 4, 6, 8, 12, 24."
+            )
+        return self
+
 
 def load_settings() -> Settings:
     """Return populated :class:`Settings`.
@@ -50,4 +62,4 @@ def load_settings() -> Settings:
 
     :raises pydantic.ValidationError: if a value fails type or range validation.
     """
-    raise NotImplementedError
+    return Settings()

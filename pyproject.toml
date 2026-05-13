@@ -42,7 +42,8 @@ dev = [
 [project.urls]
 Repository = "https://github.com/RsdNoob/dota-deals"
 
-# Script entry point intentionally not registered in scaffold phase; added when CLI is implemented.
+[project.scripts]
+dota-deals = "dota_deals.cli.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dota_deals"]

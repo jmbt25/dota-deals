@@ -163,7 +163,7 @@ CREATE INDEX IF NOT EXISTS ix_items_hero ON items(hero);
 -- Per-poll price observations. All prices are INTEGER cents (USD).
 CREATE TABLE IF NOT EXISTS price_history (
     item_id        INTEGER NOT NULL,
-    observed_at    TEXT NOT NULL,                                  -- ISO-8601 UTC, truncated to the hour
+    observed_at    TEXT NOT NULL,                                  -- ISO-8601 UTC, truncated to the polling slot
     lowest_cents   INTEGER NOT NULL CHECK (lowest_cents > 0),
     median_cents   INTEGER CHECK (median_cents IS NULL OR median_cents > 0),
     volume_24h     INTEGER CHECK (volume_24h IS NULL OR volume_24h >= 0),
@@ -263,6 +263,18 @@ idempotency directly at the DB level. Re-running ingestion for the same item at
 the same `observed_at` is a no-op via `INSERT OR IGNORE` (or
 `ON CONFLICT DO NOTHING`). `latest_observation` uses upsert (`INSERT ... ON
 CONFLICT(item_id) DO UPDATE`) so the cache always reflects the newest seen row.
+
+### Observed-at truncation
+
+Every ingestion poll writes its observations with `observed_at` truncated to the
+**polling slot**, not the wall-clock hour. For the default 8-hourly cadence the
+slots are 00:00, 08:00, 16:00 UTC; for a 6-hourly cadence the slots are 00:00,
+06:00, 12:00, 18:00 UTC. The slot is computed as
+`floor(now.hour / cadence_hours) * cadence_hours`, then minute/second/microsecond
+zeroed. Because `(item_id, observed_at)` is a primary key with idempotent inserts,
+this guarantees that an accidental rerun within the same slot (e.g., a retry
+after a partial Steam outage) is a no-op rather than a duplicate. The cadence
+must divide 24 evenly — enforced in `Settings`.
 
 ### Daily price derivation
 

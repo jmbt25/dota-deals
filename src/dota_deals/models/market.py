@@ -3,59 +3,151 @@
 These types validate Steam's responses strictly, then expose the data in
 canonical form (prices as ``int`` cents, USD). Internal code never sees raw
 Steam payloads — they pass through these models first.
+
+Pricing string parsing is locked to USD because every request the
+:mod:`dota_deals.ingest.steam` client makes pins ``currency=1``. Non-USD
+strings will fail validation and route to quarantine, which is the right
+behavior — we'd rather surface the misconfiguration than silently mis-store
+amounts in the wrong currency.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+_USD_PATTERN = re.compile(r"^\s*\$([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)(?:\.([0-9]{2}))?\s*$")
+_INT_WITH_COMMAS = re.compile(r"^\s*([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)\s*$")
+
+
+def _parse_usd_cents(raw: str) -> int:
+    """Convert a USD currency string (e.g. ``"$3.45"``, ``"$1,234.56"``) to int cents.
+
+    :raises ValueError: if ``raw`` does not match the expected USD format. The
+        steam client wraps this as :class:`IngestValidationError` and routes
+        the response to the quarantine table.
+    """
+    match = _USD_PATTERN.match(raw)
+    if match is None:
+        raise ValueError(f"unparseable USD price: {raw!r}")
+    dollars_part = match.group(1).replace(",", "")
+    cents_part = match.group(2) or "00"
+    try:
+        amount = Decimal(f"{dollars_part}.{cents_part}")
+    except InvalidOperation as e:
+        raise ValueError(f"invalid USD decimal: {raw!r}") from e
+    if amount <= 0:
+        raise ValueError(f"price must be positive: {raw!r}")
+    cents = (amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return int(cents)
+
+
+def _parse_int_with_commas(raw: str) -> int:
+    """Parse Steam's volume string (e.g. ``"12"``, ``"1,234"``) to int.
+
+    :raises ValueError: if ``raw`` is not a comma-grouped integer.
+    """
+    match = _INT_WITH_COMMAS.match(raw)
+    if match is None:
+        raise ValueError(f"unparseable integer: {raw!r}")
+    return int(match.group(1).replace(",", ""))
+
+
+def _maybe_str(value: object) -> str | None:
+    """Return ``value`` if it's a non-empty string, else ``None``."""
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
 
 
 class SteamPriceOverview(BaseModel):
     """Normalized ``/market/priceoverview`` response.
 
     The raw Steam response carries localized currency strings (e.g.
-    ``"$3.45"``); :meth:`from_raw` converts those to ``int`` cents.
+    ``"$3.45"``); the ``mode="before"`` model validator converts those to
+    ``int`` cents. Construction with keyword arguments (already-normalized
+    shape) is also supported, which is what tests use.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="ignore")
 
     success: bool
     lowest_cents: int | None = Field(default=None, gt=0)
     median_cents: int | None = Field(default=None, gt=0)
     volume_24h: int | None = Field(default=None, ge=0)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_steam_shape(cls, data: object) -> object:
+        if not isinstance(data, Mapping):
+            return data
+        # Detect raw Steam shape (presence of any string-typed price field).
+        if any(k in data for k in ("lowest_price", "median_price", "volume")):
+            lowest = _maybe_str(data.get("lowest_price"))
+            median = _maybe_str(data.get("median_price"))
+            volume = _maybe_str(data.get("volume"))
+            return {
+                "success": bool(data.get("success", False)),
+                "lowest_cents": _parse_usd_cents(lowest) if lowest else None,
+                "median_cents": _parse_usd_cents(median) if median else None,
+                "volume_24h": _parse_int_with_commas(volume) if volume else None,
+            }
+        return data
+
     @classmethod
     def from_raw(cls, payload: Mapping[str, object]) -> Self:
         """Parse a raw Steam JSON payload into a validated instance.
 
-        Handles the localized currency string format and the absence of fields
-        when ``success`` is false.
+        Thin alias for :meth:`pydantic.BaseModel.model_validate`; preserves the
+        public surface promised in ``docs/ARCHITECTURE.md``.
 
-        :raises pydantic.ValidationError: if required fields are missing or
-            unparseable.
+        :raises pydantic.ValidationError: if the payload cannot be normalized
+            or fails field validation.
         """
-        raise NotImplementedError
+        return cls.model_validate(payload)
 
 
 class SteamListingsResponse(BaseModel):
-    """Normalized listings histogram response.
+    """Normalized listings render response.
 
-    Used to count items currently for sale (Signal 2 input).
+    Steam's ``/market/listings/<appid>/<name>/render`` endpoint returns a
+    JSON body containing ``total_count`` (and a lot of HTML the client doesn't
+    care about); we keep only the count.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="ignore")
 
     success: bool
     listings_count: int = Field(ge=0)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_steam_shape(cls, data: object) -> object:
+        if not isinstance(data, Mapping):
+            return data
+        if "total_count" in data:
+            total = data["total_count"]
+            if isinstance(total, str):
+                listings_count = _parse_int_with_commas(total)
+            elif isinstance(total, int):
+                listings_count = total
+            else:
+                raise ValueError(f"unparseable total_count: {total!r}")
+            return {
+                "success": bool(data.get("success", False)),
+                "listings_count": listings_count,
+            }
+        return data
+
     @classmethod
     def from_raw(cls, payload: Mapping[str, object]) -> Self:
-        """Parse the raw histogram payload into total listings count.
+        """Parse the raw render payload into total listings count.
 
-        :raises pydantic.ValidationError: if required fields are missing or
+        :raises pydantic.ValidationError: if ``total_count`` is missing or
             unparseable.
         """
-        raise NotImplementedError
+        return cls.model_validate(payload)

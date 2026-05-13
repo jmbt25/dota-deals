@@ -16,6 +16,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+_SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
+
 
 class StorageError(Exception):
     """Base for any domain-specific exception raised by the storage layer."""
@@ -38,7 +40,18 @@ def connect(path: Path) -> sqlite3.Connection:
 
     :raises StorageError: if the path cannot be opened or initialized.
     """
-    raise NotImplementedError
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise StorageError(f"cannot create parent directory for {path}: {e}") from e
+    try:
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA journal_mode = WAL;")
+        return conn
+    except sqlite3.Error as e:
+        raise StorageError(f"failed to open database at {path}: {e}") from e
 
 
 def bootstrap_schema(conn: sqlite3.Connection) -> None:
@@ -49,4 +62,12 @@ def bootstrap_schema(conn: sqlite3.Connection) -> None:
 
     :raises SchemaError: if the schema file cannot be read or fails to apply.
     """
-    raise NotImplementedError
+    try:
+        sql = _SCHEMA_PATH.read_text(encoding="utf-8")
+    except OSError as e:
+        raise SchemaError(f"cannot read schema.sql at {_SCHEMA_PATH}: {e}") from e
+    try:
+        conn.executescript(sql)
+        conn.commit()
+    except sqlite3.Error as e:
+        raise SchemaError(f"schema bootstrap failed: {e}") from e
