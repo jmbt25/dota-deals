@@ -43,8 +43,12 @@ class Settings(BaseSettings):
 
     log_format: LogFormat = Field(default="console")
 
-    # Cloudflare R2 (S3-compatible). All optional — when unset the R2 client
-    # raises a clear configuration error rather than guessing at endpoints.
+    # Cloudflare R2 (S3-compatible). Vestigial through Phase 13: the
+    # GHA pipeline no longer calls ``dota-deals db pull`` / ``db push``
+    # since storage moved to D1 in Phase 9, but the publish.r2 module
+    # and these settings remain in-tree so removing them is a single
+    # Phase 13 commit rather than spread across multiple. Leave unset;
+    # setting them has no effect on the live pipeline.
     r2_endpoint: str | None = Field(default=None)
     r2_bucket: str | None = Field(default=None)
     r2_access_key_id: str | None = Field(default=None)

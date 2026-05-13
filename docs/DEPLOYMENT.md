@@ -3,94 +3,97 @@
 ## Architecture
 
 ```
-┌─────────────────────────┐         ┌──────────────────┐
-│   GitHub Actions        │         │   Cloudflare R2  │
-│   (cron: every 8h)      │◄────────┤   dota_deals.db  │
-│                         │         └──────────────────┘
-│  db pull                │
-│  universe refresh (00h) │
-│  ingest                 │         ┌──────────────────┐
-│  signals compute (16h)  │────────►│  GitHub `main`   │
-│  score          (16h)   │  commit │  public/data/    │
-│  publish        (16h)   │         └────────┬─────────┘
-│  db push                │                  │
-└─────────────────────────┘                  │ auto-deploy
-                                             ▼
-                                   ┌──────────────────────┐
-                                   │  Cloudflare Pages    │
-                                   │  dotadeals.com       │
-                                   └──────────────────────┘
+┌─────────────────────────────┐         ┌──────────────────┐
+│  GitHub Actions             │         │  Cloudflare D1   │
+│  (cron: every 8h)           │◄───────►│  dota-deals      │
+│                             │  HTTP   │  (ENAM region)   │
+│  wrangler d1 migrate        │  REST   └──────────────────┘
+│  universe refresh   (00h)   │
+│  ingest                     │
+│  signals compute    (16h)   │
+│  score              (16h)   │
+└─────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────┐
+│  Cloudflare Pages → dotadeals.com  (Phase 10-12 STALE)       │
+│  serves the public/data/ JSON committed at Phase 10 ship.    │
+│  The pipeline no longer produces publish output; Phase 11    │
+│  builds the Worker that reads D1 directly, Phase 12 wires    │
+│  the frontend to the Worker, then this static-files path     │
+│  retires entirely.                                           │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-Three pieces of infra outside the repo:
+Two pieces of infra outside the repo:
 
-1. **Cloudflare R2 bucket** — holds the canonical SQLite DB between runs.
+1. **Cloudflare D1 database** — `dota-deals`, region ENAM. UUID
+   `cbd9fdf6-127b-4295-aeb9-5c1ea9aca9a7`. See `docs/D1_MIGRATION.md`
+   for the storage architecture and the operational details.
 2. **Cloudflare Pages project** — serves `public/` as a static site.
-3. **GitHub Actions secrets** — let the workflow authenticate to R2.
+   Still deployed at every push to `main`, but the pipeline no
+   longer commits to `public/data/`, so the site serves whatever
+   was committed last (the Phase 10 ship state).
 
 Everything below is one-time setup. Once it's done the pipeline runs
 unattended; you only return for failures or feature work.
 
-## One-time: create the R2 bucket
+## Known gap during Phases 10 – 12
 
-In the Cloudflare dashboard:
+The live frontend at `dotadeals.com` is intentionally stale through
+this window:
 
-1. **R2 → Create bucket.** Name: `dota-deals` (or your choice — record it
-   for the `R2_BUCKET` secret below). Region: `auto`. No object lifecycle
-   rules needed.
-2. **(Recommended) Enable versioning.** R2 → Settings → Object Versioning →
-   Enable. Lets you roll back to a previous DB if a workflow run leaves a
-   corrupt file. Not required, but cheap insurance — the SQLite file is
-   small.
-3. **No CORS configuration needed.** R2 only serves the DB to the workflow
-   itself, never to the browser. The frontend reads JSON from Pages, not
-   R2.
-4. **Create an API token.** R2 → Manage API Tokens → Create API Token.
-   Permissions: **Object Read & Write** scoped to the `dota-deals` bucket.
-   Save the **Access Key ID** and **Secret Access Key** — Cloudflare shows
-   the secret exactly once.
-5. **Record the S3 endpoint.** R2 → Overview → "S3 API URL" — looks like
-   `https://<account>.r2.cloudflarestorage.com`. This becomes
-   `R2_ENDPOINT`.
+- **Phase 10** (this commit): the pipeline stops generating
+  `public/data/*.json`. The committed files frozen at the Phase 10
+  ship commit are what Pages keeps serving.
+- **Phase 11**: a TypeScript Worker is built that reads D1 directly
+  and serves the same wire format the static files used.
+- **Phase 12**: the frontend's `fetch()` calls are pointed at the
+  Worker. From this point the page is live against D1 again.
+- **Phase 13**: the static-files path retires; `publish/` module
+  and `public/data/` are deleted.
 
-## One-time: GitHub secrets
+This is deliberate. No production users are watching during the v1
+build-out, so trading "frontend stale for a week or two" for
+"cleaner cutover commits" was a conscious decision. If you find a
+user during this window, the message is: "the data is current in
+D1 (visible via `wrangler d1 execute --remote ...`), the
+public-facing view is on a planned-stale period through Phase 12."
 
-Repo Settings → Secrets and variables → Actions → New repository secret.
-Add four:
+## One-time: GitHub Actions secrets
 
-| Name | Value |
-|---|---|
-| `R2_ENDPOINT` | `https://<account>.r2.cloudflarestorage.com` |
-| `R2_BUCKET` | `dota-deals` (or whatever you named the bucket) |
-| `R2_ACCESS_KEY_ID` | from the R2 API token |
-| `R2_SECRET_ACCESS_KEY` | from the R2 API token |
+Repo Settings → Secrets and variables → Actions. The pipeline needs
+four secrets:
 
-The workflow uses these as environment variables; the dota-deals CLI reads
-them via `pydantic-settings`. No other auth needed — the workflow's
-`GITHUB_TOKEN` is auto-provided and has `contents: write` per the explicit
-`permissions:` block.
+| Name | Value | Used by |
+|---|---|---|
+| `CLOUDFLARE_ACCOUNT_ID` | your Cloudflare account ID (dashboard URL or "Account ID" widget) | `dota-deals` CLI via pydantic-settings |
+| `CLOUDFLARE_D1_DATABASE_ID` | `cbd9fdf6-127b-4295-aeb9-5c1ea9aca9a7` | `dota-deals` CLI |
+| `CLOUDFLARE_D1_API_TOKEN` | a token with scope `Account → D1 → Edit` on this database only | `dota-deals` CLI |
+| `CLOUDFLARE_API_TOKEN` | a separate token with `D1: Edit` + `Workers Scripts: Edit` scopes | `wrangler` CLI (for the migrate step + Phase 11 Worker deploy) |
+
+The two D1 tokens are deliberately distinct:
+
+- `CLOUDFLARE_D1_API_TOKEN` is narrowly scoped to one database. The
+  Python CLI uses it for every D1 read/write at pipeline time. If
+  it leaks, blast radius is one database.
+- `CLOUDFLARE_API_TOKEN` is what wrangler reads from the env (a fixed
+  variable name; you can't rename it). It covers the migrate step
+  in Phase 10 and the Worker deploy in Phase 11, so its scope is
+  broader. Treat it as the higher-privilege secret.
+
+Create the wrangler token: dashboard → My Profile → API Tokens →
+Create Custom Token. Permissions: `Account → D1 → Edit` and
+`Account → Workers Scripts → Edit`. Account Resources: your account.
+Cloudflare shows the token value exactly once.
 
 ## One-time: Cloudflare Pages
 
-We use Cloudflare's **GitHub integration** — the pipeline workflow
-commits to `main`, Pages picks up the commit and deploys. The original
-Phase 8 plan called this "Option A, no wrangler needed", but
-Cloudflare's current Pages UI requires an explicit Deploy command and
-that command is a `wrangler pages deploy` invocation. The integration
-is still automatic in the sense that Pages-the-product still listens to
-git push events; "no wrangler" is no longer reality.
+The Pages project continues to exist through Phase 12 (the frontend
+deploys at every push to `main`), so this setup stays valid. If
+you're bootstrapping a fresh project mid-Phase 10:
 
-That means we need a Cloudflare API token. The setup below covers it.
-
-1. **Cloudflare → Pages → Create application → Connect to Git.** Choose
-   this repo. Branch: `main`.
-2. **Build settings.** Cloudflare's current Pages UI requires the
-   Deploy command field to be non-empty. With the default
-   `npx wrangler pages deploy public` it fails (wrangler can't infer
-   which Pages project to push to), so the command needs an explicit
-   `--project-name`. Substitute the name you gave the Pages project at
-   step 1 — it's the prefix of your `*.pages.dev` subdomain and also
-   appears in the dashboard URL.
+1. **Cloudflare → Pages → Create application → Connect to Git.** Branch: `main`.
+2. **Build settings:**
 
    | Field | Value |
    |---|---|
@@ -98,175 +101,127 @@ That means we need a Cloudflare API token. The setup below covers it.
    | Build command | **(empty)** |
    | Build output directory | **`public`** |
    | Root directory | **(empty / project root)** |
-   | Deploy command | **`npx wrangler pages deploy public --project-name=YOUR_PROJECT_NAME`** (substitute your Pages project name). The `--project-name` flag is what makes wrangler deploy here instead of failing with "Must specify a project name." |
+   | Deploy command | **`npx wrangler pages deploy public --project-name=YOUR_PROJECT_NAME`** |
 
-   Wrangler deploys to whatever `--project-name` resolves to — if you
-   copy this command into another repo, double-check the name. It's an
-   easy way to accidentally publish to the wrong project.
-
-   *(If you'd rather not pin the project name in the dashboard, commit
-   a `wrangler.toml` at the repo root with `name = "your-project-name"`
-   and `pages_build_output_dir = "public"`. The deploy command then
-   reduces to `npx wrangler pages deploy` and wrangler reads the rest.
-   The dashboard approach is simpler for a single deployment target.)*
-3. **Create a Cloudflare API token** at
-   <https://dash.cloudflare.com/profile/api-tokens>. The auto-injected
-   `CLOUDFLARE_API_TOKEN` that Pages provides to the build environment
-   doesn't have `Pages:Edit` scope, so the wrangler deploy in step 2
-   would fail with `Authentication error [code: 10000]`. A user-created
-   token with the right scope overrides the auto-injected one.
-
-   - Click **Create Token** → use the **"Cloudflare Pages — Edit"**
-     template, *or* "Create Custom Token" with `Account → Cloudflare
-     Pages → Edit`.
-   - **Account Resources:** Include → your account.
-   - Create. **Copy the token now — Cloudflare shows it exactly once.**
-     Treat it as a real secret (same handling as the R2 keys).
-
-4. **Environment variables (Production, required).** Settings → Environment
-   variables → Production → Add variable. Two are required:
+3. **Pages-side env vars (Production):**
 
    | Name | Value | Type | Why |
    |---|---|---|---|
-   | `CLOUDFLARE_API_TOKEN` | (paste the token from step 3) | **Encrypted** | Overrides Pages's auto-injected token so wrangler can actually deploy. Without it: `Authentication error [code: 10000]`. |
-   | `SKIP_DEPENDENCY_INSTALL` | `1` | Plain text | The pipeline's `pyproject.toml` at the repo root makes Cloudflare auto-detect a Python project and try to `pip install .` before serving. The frontend doesn't need Python at all; this tells Pages to skip the install step entirely. Without it, the build fails with `Package 'dota-deals' requires a different Python: 3.13.3 not in '<3.13,>=3.12'`. |
+   | `CLOUDFLARE_API_TOKEN` | a token with `Cloudflare Pages: Edit` scope | Encrypted | Overrides Pages's auto-injected token so wrangler can deploy. Note: this is a *third* Cloudflare token, separate from the two GitHub Actions ones above — Pages's build environment is its own world. |
+   | `SKIP_DEPENDENCY_INSTALL` | `1` | Plain text | Pages auto-detects `pyproject.toml` and tries to `pip install`. The frontend doesn't need Python. |
 
-   (Alternative to the skip variable if you can't skip for some reason:
-   set `PYTHON_VERSION=3.12.10`. The install will succeed but burn
-   build minutes on dependencies the frontend never uses. Prefer the
-   skip variable.)
+4. **Custom domain** (optional): Pages → your project → Custom
+   domains → `dotadeals.com`. DNS handles itself if the domain is
+   registered through Cloudflare.
 
-5. **Save and Deploy.** First deploy may serve an empty site if no
-   `public/data/*.json` exists yet — that's the cold-start case the
-   frontend handles (it'll render the error state at first, then the
-   warmup state once the first scheduled run completes).
-6. **Note the `*.pages.dev` URL** Cloudflare gives you. Open it; you
-   should see the dota-deals UI in error state (no data yet) or warmup
-   state (after the first scheduled run).
+## One-time: D1 schema
 
-## One-time: custom domain
+The pipeline's first step on every run is
+`wrangler d1 migrations apply dota-deals --remote`, which is
+idempotent. But to seed an empty database manually before the first
+scheduled run (recommended), do it once from your local environment:
 
-Once the `*.pages.dev` URL works:
+```bash
+wrangler d1 create dota-deals       # already done; UUID captured above
+wrangler d1 migrations apply dota-deals --remote
+wrangler d1 execute dota-deals --remote \
+    --command "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
+```
 
-1. **Cloudflare → Pages → your project → Custom domains → Set up custom
-   domain.** Enter `dotadeals.com`.
-2. **DNS:** if the domain is registered through Cloudflare, Pages adds
-   the CNAME automatically. Otherwise add a CNAME at your registrar
-   pointing `dotadeals.com` → `<project>.pages.dev`.
-3. **Wait for SSL.** Cloudflare provisions an Edge certificate within
-   a few minutes. The custom domain shows "Active" when ready.
+Verify the table list is the expected nine plus wrangler's housekeeping
+(`_cf_KV`, `d1_migrations`, `sqlite_sequence`).
 
-## Trigger the first run
+`docs/D1_MIGRATION.md` has the full storage-layer architecture; this
+section is just the operational quickstart.
 
-After secrets are set:
+## Pipeline schedule
 
-1. **GitHub → Actions → pipeline → Run workflow.** Leave `skip_ingest`
-   unchecked.
-2. **Watch the run.** The first run will:
-   - Pull the DB — finds nothing in R2 → creates an empty local file
-     and logs `first_run=true`.
-   - Universe refresh — only if you triggered the manual run while UTC
-     hour happens to be 00; for the typical "trigger anytime" case,
-     this step is skipped on manual dispatch by design. To force it,
-     wait for the 00 UTC scheduled run or trigger manually at 00 UTC.
-   - Ingest — requires the items table to be populated, so the first
-     manual run before any universe refresh will produce
-     `items_failed = <items_in_file>` (the items list comes from the
-     DB; an empty DB means an empty items.txt, and ingest exits cleanly
-     with zero work).
-   - Late-day stages — run because manual dispatch always triggers
-     them. With an empty DB they produce a warmup `health.json` and
-     an empty `latest.json`.
-   - Commit `public/data/` — if anything changed.
-   - Push DB to R2 — the empty SQLite gets uploaded as the canonical
-     baseline.
+The workflow at `.github/workflows/pipeline.yml` runs on cron and on
+manual dispatch. Three stages, gated by the resolved hour:
 
-The recommended cold-start sequence is therefore:
+| Time (UTC) | What runs |
+|---|---|
+| `00:00` | wrangler d1 migrate + universe refresh + ingest |
+| `08:00` | wrangler d1 migrate + ingest |
+| `16:00` | wrangler d1 migrate + ingest + signals + score |
 
-1. Wait for the next 00 UTC scheduled run (universe + ingest).
-2. Wait for the next 16 UTC scheduled run (signals + score + publish).
-3. Verify the frontend at `*.pages.dev` shows the warmup view with
-   real `data_coverage` numbers.
+The migrate step runs every invocation (idempotent; no-op when
+nothing new is in `migrations/`). This means a freshly-committed
+migration applies before the next pipeline step touches the schema
+it expects.
 
 ## Manual runs
 
-Use **Actions → pipeline → Run workflow** any time. Two checkboxes:
+**Actions → pipeline → Run workflow.** One input:
 
 | `skip_ingest` | Behavior |
 |---|---|
-| **off** (default) | Same as a scheduled run, except universe refresh is always skipped on manual dispatch. The late-day stages always run. Use this to force a fresh report between scheduled slots. |
-| **on** | No Steam hits. Re-runs signals + score + publish against existing data. Use after a fix to one of those stages — re-render without re-ingesting. |
+| **off** (default) | Same as a scheduled run, except universe refresh is always skipped on manual dispatch. Late-day stages (signals + score) always run on manual dispatch. Use to force a fresh compute between scheduled slots. |
+| **on** | No Steam hits. Re-runs signals + score against existing data. Use after a fix to one of those stages to recompute against the same ingest. |
 
-The workflow's run summary (top of each run page in the GHA UI) prints
-the resolved `run_universe / run_ingest / run_late` flags so you can
-verify which stages actually executed.
+The workflow's run summary (top of each run page in the GHA UI)
+prints the resolved `run_universe / run_ingest / run_late` flags so
+you can verify which stages actually executed.
+
+## Trigger the first post-Phase-10 run
+
+After secrets are set and the workflow file is on `main`:
+
+1. **GitHub → Actions → pipeline → Run workflow.** Leave
+   `skip_ingest` off.
+2. **Watch the run.** It should:
+   - Apply D1 migrations (no-op).
+   - Skip universe refresh (manual dispatch ≠ 00 UTC).
+   - Run ingest against the existing items table.
+   - Run signals + score (manual dispatch always triggers them).
+3. **Verify in D1.** From a local shell:
+   ```bash
+   wrangler d1 execute dota-deals --remote \
+       --command "SELECT kind, status, items_ok, items_failed, items_quarantined, started_at \
+                  FROM runs ORDER BY started_at DESC LIMIT 5"
+   ```
+   The last three rows should be the just-completed ingest +
+   signals + scoring runs from the manual dispatch.
+
+The next scheduled cron run is the real test. If something
+fails in production, the fix is a follow-up commit, not a
+workflow-config tweak — diagnose from the Actions log and the
+D1 query log (Cloudflare dashboard → Workers & Pages → D1 →
+dota-deals → Logs).
 
 ## Failure recovery
 
-Failures show up as red ❌ in the Actions tab and (if you've enabled it
-in your GitHub notification settings) as email. The run summary always
-prints the flag table; combine that with the failed step's logs to
-diagnose.
+Failures show up as red ❌ in the Actions tab and (if you've enabled
+it in your GitHub notification settings) as email. The run summary
+always prints the flag table; combine that with the failed step's
+logs to diagnose.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `R2ConfigError: requires R2_ENDPOINT, …` | A secret is missing or empty. | Add it under Settings → Secrets. The exact missing field is in the error. |
-| `R2CredentialsError: rejected credentials` | The API token was rotated or never had write access. | Recreate the token (R2 → Manage API Tokens), update `R2_ACCESS_KEY_ID` + `R2_SECRET_ACCESS_KEY`. |
-| `R2BucketMissing: dota-deals does not exist` | Wrong `R2_BUCKET` name, or bucket was deleted. | Verify the name; recreate the bucket if needed. |
-| `ingest run finished status=partial` | Steam returned 4xx/5xx for some items. Not a workflow failure — just a partial day. | Investigate in the next run's run summary; if persistent, check Steam status or the rarity tag values in `ingest/universe.py`. |
-| `network error` from `db pull` / `db push` | Transient Cloudflare blip. | Re-run via workflow_dispatch. The retry loop in `r2.py` handles short blips; a longer outage surfaces here. |
-| Workflow times out at 30m | Probably the ingest hit a sustained 429 storm. | Wait an hour; re-run with `skip_ingest=true` to push out the late-day stages on existing data. |
-| **Pages build fails:** `Package 'dota-deals' requires a different Python: 3.13.3 not in '<3.13,>=3.12'` | Cloudflare Pages saw `pyproject.toml` at the repo root and auto-detected a Python project, then tried to install with its default Python (3.13). The frontend doesn't need any Python deps — the pipeline's pyproject is unrelated. | Set `SKIP_DEPENDENCY_INSTALL=1` in Pages → Settings → Environment variables → Production, then retry the deploy from the Deployments tab. See the "One-time: Cloudflare Pages" section above for the full env-var table. |
-| **Pages deploy fails:** `Executing user deploy command: npx wrangler pages deploy public` → `Must specify a project name.` | Cloudflare's current Pages UI requires the Deploy command field, and the default `npx wrangler pages deploy public` doesn't include `--project-name`, so wrangler bails. | Set the Deploy command to `npx wrangler pages deploy public --project-name=YOUR_PROJECT_NAME` (substitute the name from the `*.pages.dev` subdomain) in Pages → Settings → Builds & deployments → Build configurations. Save, retry. See the build-settings table above for the full set. |
-| **Pages deploy fails:** `Authentication error [code: 10000]` from wrangler hitting `/accounts/<id>/pages/projects/<name>` | Pages's auto-injected `CLOUDFLARE_API_TOKEN` doesn't have `Pages:Edit` scope, so wrangler can authenticate (the log shows your email) but can't actually push a deployment. | Create a user-managed API token with `Account → Cloudflare Pages → Edit` scope at <https://dash.cloudflare.com/profile/api-tokens>, then set `CLOUDFLARE_API_TOKEN` (Encrypted) in Pages → Settings → Environment variables → Production. The user-set value overrides the auto-injected one. See step 3 of "One-time: Cloudflare Pages" above. |
-| **Pages build fails before running any command:** `Your build is configured with a build token that belongs to a user who has left your organization.` | Distinct from `CLOUDFLARE_API_TOKEN` — this is the **build token** Cloudflare's build system itself uses to clone the repo and start the build container. The wording is misleading for personal accounts; it just means the original token has rotated or been invalidated. | Pages → your project → Settings tab → **Builds** section → **API token** → "Select or create a new build token" (button wording varies). Save, retry. Doesn't affect the `CLOUDFLARE_API_TOKEN` env var; both tokens coexist. |
+| `D1ConfigError: CLOUDFLARE_ACCOUNT_ID is not set` (or similar) | A secret is missing or empty. | Add it under Settings → Secrets. The exact missing field is in the error message. |
+| `D1AuthError: D1 authentication failed (HTTP 401)` | The `CLOUDFLARE_D1_API_TOKEN` was rotated or never had `D1: Edit` on this database. | Recreate the token in the Cloudflare dashboard, update the GitHub secret. |
+| `D1NotFoundError: D1 endpoint returned 404` | Wrong `CLOUDFLARE_ACCOUNT_ID` or `CLOUDFLARE_D1_DATABASE_ID`. | Verify both via `wrangler d1 list`. |
+| `wrangler: command not found` in the migrate step | Node version mismatch or stale runner cache. | Re-run the workflow; the `npx` invocation pulls wrangler on demand. If persistent, pin the Node version in the workflow. |
+| `Authentication error [code: 10000]` from wrangler in the migrate step | `CLOUDFLARE_API_TOKEN` (the wrangler-side token, distinct from `CLOUDFLARE_D1_API_TOKEN`) is missing or has wrong scope. | Create the token with `Account → D1 → Edit + Account → Workers Scripts → Edit`, save as the `CLOUDFLARE_API_TOKEN` repo secret. |
+| `signals run finished status=partial` with high `items_failed` | Most items have insufficient signal coverage (warmup, or an ingest-side regression broke the prior day's writes). | Inspect via `wrangler d1 execute --remote --command "SELECT signal_name, value, metadata_json FROM signals ORDER BY computed_for DESC LIMIT 20"`. |
+| `ingest run finished status=partial` | Steam returned 4xx/5xx for some items. Not a workflow failure — just a partial day. | Investigate in the next run's summary; if persistent, check Steam status or the rarity tag values. |
+| `too many SQL variables at offset N: SQLITE_ERROR` | A repository bulk-read passed > 100 bound parameters in one statement. The async repo's `_BULK_QUERY_CHUNK_SIZE=90` should prevent this for in-tree code; if a new call site triggers it, the fix is to chunk the IN clause. | Reduce chunk size or split the query. |
+| Workflow times out at 30m | Probably the ingest hit a sustained 429 storm. | Wait an hour; re-run with `skip_ingest=on` to push out the late-day stages on existing data. |
 
-## Rolling back a bad publish
-
-Two scenarios:
-
-**Bad public/data/ committed (frontend shows wrong scores).**
-The chore commit is on `main`. Revert it:
-
-```bash
-git revert <chore-commit-sha>     # creates a "Revert chore: publish ..." commit
-git push origin main
-```
-
-Cloudflare Pages picks up the revert commit and redeploys within a minute
-or two. The previous good `public/data/` content is restored on the live
-site. Safe to do at any time; doesn't affect the pipeline.
-
-If you also need to fix the data going forward, run the workflow manually
-with `skip_ingest=true` after fixing whatever produced the bad scores
-(e.g., a weight tweak in `scoring/buy_score.py`). The new chore commit
-will overwrite the reverted state with the corrected report.
-
-**Bad SQLite DB pushed to R2 (subsequent runs use stale/corrupt data).**
-
-* If R2 versioning is enabled (recommended in the setup section):
-  Cloudflare dashboard → R2 → your bucket → `dota_deals.db` → Versions →
-  restore the previous version. Next workflow run picks up the rolled-
-  back state.
-* If versioning is not enabled and the DB is unrecoverable: delete the
-  R2 object. The next `dota-deals db pull` finds nothing → creates an
-  empty local file → the pipeline rebuilds forward from scratch. Loses
-  all history; the 30-day warmup window starts over.
-
-Choose versioning during setup. The cost is negligible (a few MB even
-with daily snapshots) and the recovery option is real.
+The "rolling back a bad publish" section that used to live here is
+gone with the publish step. Phase 11 reintroduces a "rolling back
+the Worker" story when the Worker exists.
 
 ## Things not in scope for v1
 
-- **Monitoring beyond GHA's built-in failure emails.** The Actions tab
-  shows red ❌ on failure and emails you (if your GitHub notification
-  settings allow). No PagerDuty, no Slack — overkill for an 8-hourly
-  cron with no SLO.
-- **Concurrency lockfiles.** The workflow's `concurrency` block prevents
-  two runs from overlapping. R2's two-phase upload pattern means a
-  pathological overlap still wouldn't corrupt the canonical key.
+- **Monitoring beyond GHA's built-in failure emails.** The Actions
+  tab shows red ❌ on failure and emails you (if your GitHub
+  notification settings allow). No PagerDuty, no Slack — overkill
+  for an 8-hourly cron with no SLO.
+- **Concurrency lockfiles.** The workflow's `concurrency` block
+  prevents two runs from overlapping. D1's transactional batch
+  writes mean a pathological overlap still wouldn't corrupt
+  table state.
 - **Multi-environment (staging / prod).** v1 deploys directly to
-  `dotadeals.com`. If you ever want a staging slot, the cleanest path is
-  a second R2 bucket + a second Pages project on a different branch.
-  `R2_DB_KEY` already supports `prod/dota_deals.db` vs
-  `staging/dota_deals.db` if you want them sharing a bucket.
+  `dotadeals.com`. A staging environment would be a second D1
+  database + a second Pages project pointed at a branch.

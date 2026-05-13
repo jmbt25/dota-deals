@@ -2,13 +2,58 @@
 
 dota-deals' storage is Cloudflare D1, accessed over the public REST API.
 The pipeline runs as a Python process on GitHub Actions and talks to D1
-via async HTTP. The frontend reads JSON files committed to
-`public/data/`; a future TypeScript Worker that serves directly from D1
-is sketched but not built.
+via async HTTP. As of Phase 10, the GHA workflow is committed to D1 —
+the pipeline no longer pulls/pushes SQLite via R2, and no longer
+generates static `public/data/` JSON. The frontend at `dotadeals.com`
+serves whatever was committed at Phase 10 ship and stays stale until
+Phase 12 wires it to the Worker that's built in Phase 11.
 
-This doc is the operational reference. The migration that produced it
-(local SQLite synced to R2 → D1) is complete as of Phase 9c-iv —
-that history is in the git log, not here.
+This doc is the operational reference. The migration narrative is
+captured below as the eight-commit table; the surrounding sections
+document how the live storage layer behaves.
+
+## Migration narrative
+
+The path from R2-synced SQLite to async D1 took eight commits. Each
+phase produced at least one reality-only bug that no mocked test
+could have caught; every such bug is now pinned by a regression test
+listed in the table.
+
+| Commit | Phase | What landed | Reality-only catch |
+|---|---|---|---|
+| `232958d` | 9a | D1 HTTP client + schema migration + Pydantic envelopes + 23 wire tests | — |
+| `c967f8d` | 9a fix | `wrangler.toml` so `migrations apply` finds the binding | smoke-test prerequisite (`No configuration file found`) |
+| `90d2598` | 9b | Async storage layer alongside sync (no caller flipped yet) | — |
+| `f71a900` | 9c-i | Cut ingest runner; converted `test_ingest`; D1FakeClient seam | — |
+| `b07cb98` | 9c-i fix | Steam React-SSR migration broke `/render` JSON endpoint; pivot to `search/render?norender=1` with exact `hash_name` filter | quarantined HTML payloads against real Steam |
+| `e5a2d89` | 9c-ii | Cut signals layer + `DataLookup` pre-fetch pattern (O(items × signals) HTTP calls → ~8 total) | D1 `/query` batch shape must be `{"batch": [...]}` not a bare array (HTTP 400 code 7400) |
+| `44b5776` | 9c-iii | Cut scoring/publish/universe runners + bulk-read functions | D1 per-statement bound-parameter limit is 100, not the SQLite default of 999 (`too many SQL variables`) |
+| `8527795` | 9c-iv | Delete sync code; rename `*_async` → unsuffixed; consolidate docs | — |
+| `<this commit>` | 10 | GHA workflow rewrite: D1 migrate step, ingest/signals/score against D1, R2 sync removed, publish step removed | — |
+
+The pattern across the phases: every cutover commit produced one
+reality-only bug. The smoke-test discipline (each cutover phase
+finished with a manual run against real D1, not just the mocked
+test suite) is what caught them before the live cron noticed. That
+workflow choice is worth more than any individual technical
+decision in the migration.
+
+## Why D1
+
+Three constraints pushed us off R2-synced SQLite:
+
+1. **Concurrency.** With R2 sync, only one run can hold the database at
+   a time. Ad-hoc tools (backfill scripts, one-off queries from a
+   Worker, the eventual REST API) don't compose with a single-writer
+   pattern.
+2. **Frontend story.** The post-MVP plan serves item-detail pages from
+   a Worker that queries the database directly. A Worker can read D1 in
+   milliseconds; reading R2-SQLite would mean re-downloading the whole
+   file per request.
+3. **Operational surface.** D1 gives us `wrangler d1 execute` /
+   `wrangler d1 migrations`, web-UI query inspection, and per-query
+   metrics for free. The R2-SQLite story required hand-rolled push/pull
+   plus a stuck-lock recovery story that never quite landed.
 
 ## Why D1
 

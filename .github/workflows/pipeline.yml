@@ -1,8 +1,10 @@
 name: pipeline
 
-# Scheduled pipeline: ingest 3×/day, full report 1×/day (the 16:00 UTC run).
-# See docs/DEPLOYMENT.md for the deployment story; Cloudflare Pages picks up
-# the committed `public/data/` automatically via its GitHub integration.
+# Scheduled pipeline: ingest 3x/day, full late-day compute 1x/day (the 16:00
+# UTC run). Storage is Cloudflare D1; this workflow no longer syncs SQLite
+# to R2 between runs and no longer publishes static JSON to public/data/.
+# The frontend at dotadeals.com is intentionally stale during the
+# Phase 10 - 12 window (see docs/DEPLOYMENT.md "Known gap" section).
 
 on:
   schedule:
@@ -12,35 +14,41 @@ on:
   workflow_dispatch:
     inputs:
       skip_ingest:
-        description: "Skip ingest (don't hit Steam). Use to re-run signals/score/publish after a fix."
+        description: "Skip ingest (don't hit Steam). Use to re-run signals/score after a fix."
         type: boolean
         default: false
 
-# The workflow commits `public/data/` back to main, so the default
-# GITHUB_TOKEN needs write access. Granting only `contents: write` —
-# nothing else — keeps the blast radius minimal.
+# The publish step that committed public/data/ back to main is gone in
+# Phase 10. Keeping `contents: write` is cheap headroom in case a future
+# workflow needs it; Phase 13 cleanup can drop it.
 permissions:
   contents: write
 
 # Don't let two scheduled runs overlap. The 8-hour cron and the <5-minute
 # typical runtime make collisions unlikely, but a stuck previous job +
-# a fresh schedule trigger could otherwise both touch R2 simultaneously.
+# a fresh schedule trigger could otherwise both write to D1 simultaneously.
 concurrency:
   group: pipeline
   cancel-in-progress: false
 
 env:
-  # All R2 credentials live in repo secrets (Settings → Secrets and variables
-  # → Actions). The workflow doesn't echo them; only the dota-deals CLI reads
-  # them via pydantic-settings.
-  R2_ENDPOINT:           ${{ secrets.R2_ENDPOINT }}
-  R2_BUCKET:             ${{ secrets.R2_BUCKET }}
-  R2_ACCESS_KEY_ID:      ${{ secrets.R2_ACCESS_KEY_ID }}
-  R2_SECRET_ACCESS_KEY:  ${{ secrets.R2_SECRET_ACCESS_KEY }}
-  # Where the pulled DB lands on the runner. Matches Settings.db_path's
-  # default of ./data/dota_deals.db so no override is needed.
-  DB_PATH:               ./data/dota_deals.db
-  PYTHONUNBUFFERED:      "1"
+  # ---- Cloudflare D1 (read by the dota-deals CLI via pydantic-settings) ----
+  # Storage backend. The D1 API token is scoped narrowly to "D1: Edit on
+  # this database" — see docs/D1_MIGRATION.md for the token-creation
+  # walkthrough.
+  CLOUDFLARE_ACCOUNT_ID:      ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  CLOUDFLARE_D1_DATABASE_ID:  ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+  CLOUDFLARE_D1_API_TOKEN:    ${{ secrets.CLOUDFLARE_D1_API_TOKEN }}
+
+  # ---- Cloudflare API token used by wrangler ----
+  # Wrangler reads CLOUDFLARE_API_TOKEN from the env, NOT
+  # CLOUDFLARE_D1_API_TOKEN. This is a distinct secret with broader
+  # scope (D1: Edit + Workers Scripts: Edit) — the Workers permission
+  # is unused in Phase 10 but lands now so Phase 11's Worker deploy
+  # doesn't need another token-rotation step.
+  CLOUDFLARE_API_TOKEN:       ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+  PYTHONUNBUFFERED:           "1"
 
 jobs:
   pipeline:
@@ -49,9 +57,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          # Need write history for the chore: publish commit + push.
-          persist-credentials: true
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -64,6 +69,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
+
+      - name: Apply D1 migrations
+        # Idempotent: no-op when nothing new is in migrations/. Runs on
+        # every invocation (cron and manual) so a freshly-committed
+        # migration is applied before the rest of the pipeline runs
+        # against the schema it expects. wrangler authenticates via
+        # CLOUDFLARE_API_TOKEN (set in the env block above).
+        run: npx wrangler d1 migrations apply dota-deals --remote
 
       - name: Compute run flags
         id: flags
@@ -94,9 +107,9 @@ jobs:
             RUN_INGEST=true
           fi
 
-          # Late-day stages (signals/score/publish): only the 16:00 UTC
+          # Late-day stages (signals + score): only the 16:00 UTC
           # scheduled run, OR any manual dispatch (manual is "I want a
-          # full report now").
+          # full compute now").
           if [ "$HOUR" = "16" ] || [ "$IS_MANUAL" = "true" ]; then
             RUN_LATE=true
           else
@@ -126,10 +139,6 @@ jobs:
             echo "| run_late | \`$RUN_LATE\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Pull DB from R2
-        id: db_pull
-        run: dota-deals db pull
-
       - name: Refresh universe
         if: steps.flags.outputs.run_universe == 'true'
         run: dota-deals universe refresh
@@ -151,32 +160,3 @@ jobs:
       - name: Score
         if: steps.flags.outputs.run_late == 'true'
         run: dota-deals score
-
-      - name: Publish
-        if: steps.flags.outputs.run_late == 'true'
-        run: dota-deals publish --include-items
-
-      - name: Commit & push public/data
-        if: steps.flags.outputs.run_late == 'true'
-        run: |
-          set -euo pipefail
-          git config user.name "dota-deals-bot"
-          git config user.email "bot@dota-deals.local"
-          git add public/data/
-          if git diff --cached --quiet; then
-            echo "public/data/ unchanged; skipping commit"
-            echo "* No data changes to commit." >> "$GITHUB_STEP_SUMMARY"
-          else
-            DATE=$(date -u +%Y-%m-%d)
-            TIME=$(date -u +%H:%M)
-            git commit -m "chore: publish report $DATE $TIME UTC"
-            git push origin HEAD:main
-            echo "* Published report at $DATE $TIME UTC." >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: Push DB to R2
-        # Always run if the pull succeeded — preserves any ingested rows
-        # even if a later stage (signals/score) failed. The .tmp-copy-rename
-        # upload pattern means a no-op push of an unchanged file is safe.
-        if: always() && steps.db_pull.outcome == 'success'
-        run: dota-deals db push

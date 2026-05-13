@@ -136,35 +136,44 @@ in [`docs/PUBLISH.md`](docs/PUBLISH.md); the fixtures conform to it.
 ## Deployment
 
 The system runs unattended on **GitHub Actions** (8-hourly cron in
-[.github/workflows/pipeline.yml](.github/workflows/pipeline.yml)) with the
-canonical SQLite DB synced to **Cloudflare R2** between runs. The frontend
-is hosted on **Cloudflare Pages** at
-[dotadeals.com](https://dotadeals.com) (or the project's
-`*.pages.dev` URL until the custom domain is configured).
+[.github/workflows/pipeline.yml](.github/workflows/pipeline.yml)),
+storing all data in **Cloudflare D1** via the public REST API. The
+frontend is hosted on **Cloudflare Pages** at
+[dotadeals.com](https://dotadeals.com) and is **intentionally stale
+through Phases 10 – 12** of the migration: the pipeline no longer
+generates `public/data/` JSON; Phase 11 builds a TypeScript Worker
+that reads D1 directly; Phase 12 points the frontend at the Worker.
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the "Known gap"
+section that explains this in operational terms.
 
-Full setup — R2 bucket, GitHub secrets, Pages connection, custom domain,
-failure recovery, rolling back a bad publish — is in
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). Setup is one-time; after that
-the pipeline runs on its own.
+Full setup — Cloudflare API tokens, GitHub secrets, Pages connection,
+the D1 schema migration commands, failure recovery — is in
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). The storage-layer
+architecture is in [docs/D1_MIGRATION.md](docs/D1_MIGRATION.md).
 
 The scheduled cadence:
 
 | Time (UTC) | What runs |
 |---|---|
-| `00:00` | universe refresh + ingest + db push |
-| `08:00` | ingest + db push |
-| `16:00` | ingest + signals + score + publish + commit `public/data/` + db push |
+| `00:00` | wrangler d1 migrate + universe refresh + ingest |
+| `08:00` | wrangler d1 migrate + ingest |
+| `16:00` | wrangler d1 migrate + ingest + signals + score |
 
 Manual runs via the Actions tab; a `skip_ingest` toggle lets you re-run
-signals/score/publish against existing data after a fix.
+signals + score against existing data after a fix.
 
 ## Status
 
-**v1 shipped.** Five stages implemented, scheduled pipeline configured,
-frontend live. The respx-mocked test suite exercises the full pipeline;
-the first scheduled run against real Steam is the system's actual proving
-ground. Expect early runs to surface edge cases — they go to
-[docs/FUTURE.md](docs/FUTURE.md) or directly into fixes.
+**v1 shipped, migration to Cloudflare D1 + Worker API in progress.**
+Five pipeline stages implemented and running against D1 on the
+scheduled cron. Mid-migration, the frontend is on a planned-stale
+window through Phase 12 (see Deployment above and
+[docs/D1_MIGRATION.md](docs/D1_MIGRATION.md) for the eight-commit
+narrative). The respx-mocked test suite exercises the full pipeline;
+real-Steam + real-D1 smoke tests at each cutover phase caught the
+bugs no mock could (Steam React-SSR endpoint rename, D1 batch wire
+shape, D1 100-variable limit) — see the D1_MIGRATION doc for the
+list.
 
 Warmup is real: from a cold start, the first 14 days produce no signals,
 days 14–29 produce supply-only signals, and `event_proximity` stays
