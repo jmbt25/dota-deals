@@ -70,6 +70,81 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
+      - name: Cloudflare auth diagnostic
+        # TEMPORARY (Phase 10 debug). Surfaces why wrangler is hitting
+        # /memberships with a 10000 error. Three checks:
+        #
+        #  1. Are the env vars actually populated? (length-only — no
+        #     value leakage.)
+        #  2. Does the token authenticate at all? (/user/tokens/verify
+        #     is reachable by any valid token regardless of scope.)
+        #  3. Does the token have permission to hit /memberships?
+        #     Account-scoped tokens (D1: Edit + Workers Scripts: Edit)
+        #     typically don't — that endpoint needs User → User
+        #     Details → Read. If wrangler is reaching for /memberships
+        #     in the first place, it's because CLOUDFLARE_ACCOUNT_ID
+        #     isn't set in the env so it has no account_id to use.
+        #
+        # Remove this step once we know which of (1)/(2)/(3) was the
+        # blocker.
+        run: |
+          set +e
+          echo "## Diagnostic" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "CLOUDFLARE_API_TOKEN: present (length=${#CLOUDFLARE_API_TOKEN})"
+            echo "- \`CLOUDFLARE_API_TOKEN\`: present (length=${#CLOUDFLARE_API_TOKEN})" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "CLOUDFLARE_API_TOKEN: EMPTY/UNSET — this is the bug. Fix: add the secret in repo Settings."
+            echo "- \`CLOUDFLARE_API_TOKEN\`: **EMPTY/UNSET** — fix in repo Settings" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -n "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "CLOUDFLARE_ACCOUNT_ID: present (length=${#CLOUDFLARE_ACCOUNT_ID})"
+            echo "- \`CLOUDFLARE_ACCOUNT_ID\`: present (length=${#CLOUDFLARE_ACCOUNT_ID})" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "CLOUDFLARE_ACCOUNT_ID: EMPTY/UNSET — wrangler will fall back to /memberships, which needs User-level scope."
+            echo "- \`CLOUDFLARE_ACCOUNT_ID\`: **EMPTY/UNSET** — wrangler will hit /memberships, fix in repo Settings" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo ""
+          echo "--- /user/tokens/verify ---"
+          # Any valid token can hit this endpoint regardless of scope.
+          # 200 = token valid; 401/403 = token is wrong/revoked.
+          curl -s -o /tmp/verify.json -w "HTTP %{http_code}\n" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/user/tokens/verify"
+          cat /tmp/verify.json
+          echo ""
+
+          echo "--- /memberships ---"
+          # User-level endpoint. A token scoped only to "D1: Edit" or
+          # "Workers Scripts: Edit" cannot read this; wrangler hits it
+          # when no CLOUDFLARE_ACCOUNT_ID is available.
+          curl -s -o /tmp/memberships.json -w "HTTP %{http_code}\n" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/memberships"
+          cat /tmp/memberships.json
+          echo ""
+
+          echo "--- accounts/.../d1/database (account-scoped probe) ---"
+          # Confirms the token CAN access the account's D1 resources
+          # even if /memberships is denied.
+          if [ -n "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            curl -s -o /tmp/d1list.json -w "HTTP %{http_code}\n" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database"
+            cat /tmp/d1list.json
+            echo ""
+          else
+            echo "(skipped — no CLOUDFLARE_ACCOUNT_ID to probe)"
+          fi
+
+          # Don't fail the workflow here — let the next step's real
+          # error speak. The diagnostic output above is what matters.
+          true
+
       - name: Apply D1 migrations
         # Idempotent: no-op when nothing new is in migrations/. Runs on
         # every invocation (cron and manual) so a freshly-committed
