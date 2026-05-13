@@ -24,7 +24,6 @@ The Steam-side tests are untouched — the client doesn't know about storage.
 from __future__ import annotations
 
 import asyncio
-import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -45,7 +44,12 @@ from tests._d1_fake import D1FakeClient
 from tests.conftest import insert_test_item_async
 
 PRICE_OVERVIEW = "https://steamcommunity.com/market/priceoverview/"
-LISTINGS_PATTERN = re.compile(r"https://steamcommunity\.com/market/listings/570/[^/]+/render")
+# Listings are sourced from market/search/render?norender=1 (after the
+# legacy /render JSON endpoint started serving Steam's React-SSR HTML in
+# mid-2026). The same URL is also used by universe discovery, but those
+# tests live in test_universe.py with their own respx context — no
+# cross-file collision inside this module.
+SEARCH_URL = "https://steamcommunity.com/market/search/render"
 
 # Fixed wall-clock for tests. slot_for(FIXED_NOW, 8) → 2026-01-15 08:00 UTC.
 FIXED_NOW = datetime(2026, 1, 15, 10, 30, tzinfo=UTC)
@@ -66,11 +70,45 @@ def _ok_priceoverview(
     return httpx.Response(200, json=body)
 
 
-def _ok_listings(count: int = 27) -> httpx.Response:
-    return httpx.Response(
-        200,
-        json={"success": True, "start": 0, "pagesize": 1, "total_count": count},
-    )
+def _ok_listings(count: int = 27) -> Callable[[httpx.Request], httpx.Response]:
+    """Build a respx ``side_effect`` that mirrors Steam's search/render shape.
+
+    The runner now resolves listing counts via ``search/render?norender=1
+    &query=<item>`` and filters for an exact ``hash_name`` match. The
+    returned function inspects the request's ``query`` param and embeds
+    a single result with ``hash_name=<query>`` so the runner's exact-
+    match filter succeeds for whatever item the test asked about. This
+    keeps every existing happy-path test working without per-test
+    response wiring.
+    """
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        query = request.url.params.get("query", "")
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "start": 0,
+                "pagesize": 1,
+                "total_count": 1,
+                "results": [
+                    {
+                        "name": query,
+                        "hash_name": query,
+                        "sell_listings": count,
+                        "sell_price": 345,
+                        "sell_price_text": "$3.45",
+                        "asset_description": {
+                            "market_hash_name": query,
+                            "name": query,
+                            "type": "Arcana",
+                        },
+                    }
+                ],
+            },
+        )
+
+    return respond
 
 
 def _make_recorded_sleep() -> tuple[Callable[[float], Awaitable[None]], list[float]]:
@@ -246,7 +284,7 @@ async def test_runner_happy_path(
 
     with respx.mock(assert_all_called=False) as router:
         router.get(PRICE_OVERVIEW).mock(return_value=_ok_priceoverview())
-        router.get(LISTINGS_PATTERN).mock(return_value=_ok_listings(27))
+        router.get(SEARCH_URL).mock(side_effect=_ok_listings(27))
 
         summary = await run_ingestion(
             items=["Inscribed Manifold Paradox"],
@@ -302,7 +340,7 @@ async def test_runner_4xx_run_continues(
 
     with respx.mock(assert_all_called=False) as router:
         router.get(PRICE_OVERVIEW).mock(side_effect=route_overview)
-        router.get(LISTINGS_PATTERN).mock(return_value=_ok_listings(27))
+        router.get(SEARCH_URL).mock(side_effect=_ok_listings(27))
 
         summary = await run_ingestion(
             items=["GOOD", "BAD"],
@@ -337,7 +375,7 @@ async def test_runner_validation_routes_to_quarantine(
 
     with respx.mock(assert_all_called=False) as router:
         router.get(PRICE_OVERVIEW).mock(return_value=httpx.Response(200, json=bad))
-        router.get(LISTINGS_PATTERN).mock(return_value=_ok_listings(27))
+        router.get(SEARCH_URL).mock(side_effect=_ok_listings(27))
 
         summary = await run_ingestion(
             items=["X"],
@@ -370,7 +408,7 @@ async def test_runner_idempotent_double_run(
 
     with respx.mock(assert_all_called=False) as router:
         router.get(PRICE_OVERVIEW).mock(return_value=_ok_priceoverview())
-        router.get(LISTINGS_PATTERN).mock(return_value=_ok_listings(27))
+        router.get(SEARCH_URL).mock(side_effect=_ok_listings(27))
 
         s1 = await run_ingestion(
             items=["X"], settings=settings, run_id="r-a", now=FIXED_NOW, backend=fake
@@ -416,7 +454,7 @@ async def test_runner_summary_reflects_mixed_outcomes(
 
     with respx.mock(assert_all_called=False) as router:
         router.get(PRICE_OVERVIEW).mock(side_effect=route_overview)
-        router.get(LISTINGS_PATTERN).mock(return_value=_ok_listings(27))
+        router.get(SEARCH_URL).mock(side_effect=_ok_listings(27))
 
         summary = await run_ingestion(
             items=["OK_ITEM", "BAD_ITEM", "UNKNOWN_ITEM"],
@@ -503,7 +541,7 @@ async def test_strike_counter_reset_on_success(
 
     with respx.mock(assert_all_called=False) as router:
         router.get(PRICE_OVERVIEW).mock(return_value=_ok_priceoverview())
-        router.get(LISTINGS_PATTERN).mock(return_value=_ok_listings(27))
+        router.get(SEARCH_URL).mock(side_effect=_ok_listings(27))
 
         await run_ingestion(
             items=["X"], settings=settings, run_id="r-ok", now=FIXED_NOW, backend=fake
@@ -553,3 +591,187 @@ async def test_non_4xx_failures_do_not_count_as_strikes(
         ("X",),
     )
     assert rows[0]["consecutive_ingest_4xx"] == 1
+
+
+# ----------------------------- listings endpoint regression -------------------
+
+
+@pytest.mark.asyncio
+async def test_runner_listings_html_response_quarantines(
+    settings: Settings,
+    db_conn_async: tuple[D1Connection, D1FakeClient],
+) -> None:
+    """Phase 9c-i regression. Steam's React-SSR migration in mid-2026
+    started serving the legacy ``/market/listings/<appid>/<name>/render``
+    URL with 600KB of HTML instead of the documented JSON; the fix
+    pivoted the listings call to ``search/render?norender=1``. If
+    Steam ever does the same thing to the search endpoint (or another
+    upstream change breaks the JSON contract), we want the raw body
+    landing in quarantine with a clear ``JSONDecodeError`` rather than
+    a silent count of zero. This test pins that behavior by mocking
+    HTML at the search endpoint and asserting the payload is
+    preserved.
+    """
+    conn, fake = db_conn_async
+    await insert_test_item_async(conn, market_hash="Manifold Paradox")
+
+    html_body = (
+        '<!DOCTYPE html><html lang="en" class="responsive DesktopUI">'
+        "<head><title>Market Item - Steam Community Market</title></head>"
+        "<body>SSR shell — no JSON here.</body></html>"
+    )
+
+    with respx.mock(assert_all_called=False) as router:
+        router.get(PRICE_OVERVIEW).mock(return_value=_ok_priceoverview())
+        router.get(SEARCH_URL).mock(return_value=httpx.Response(200, text=html_body))
+
+        summary = await run_ingestion(
+            items=["Manifold Paradox"],
+            settings=settings,
+            run_id="run-html",
+            now=FIXED_NOW,
+            backend=fake,
+        )
+
+    assert summary.items_quarantined == 1
+    assert summary.items_ok == 0
+    assert summary.status == "partial"
+
+    q_rows = await _select(conn, "SELECT * FROM quarantine")
+    assert len(q_rows) == 1
+    assert q_rows[0]["source"] == "steam_listings"
+    assert q_rows[0]["item_hash"] == "Manifold Paradox"
+    assert q_rows[0]["error_type"] == "JSONDecodeError"
+    assert "<!DOCTYPE html>" in q_rows[0]["raw_payload"], (
+        "raw HTML must be preserved so an operator can diagnose without re-running"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_listings_no_exact_match_fails_without_quarantine(
+    settings: Settings,
+    db_conn_async: tuple[D1Connection, D1FakeClient],
+) -> None:
+    """When ``search/render`` returns valid JSON but no result's
+    ``hash_name`` matches the requested item exactly (Steam's search is
+    fuzzy — querying ``"X"`` can return ``"X Bundle"`` and similar), the
+    runner counts the item as failed without quarantining the response
+    (the payload was well-formed; the item just wasn't in it) and
+    without accruing a 4xx strike (status_code is None, so the strike
+    counter rule doesn't apply).
+    """
+    conn, fake = db_conn_async
+    await insert_test_item_async(conn, market_hash="Manifold Paradox")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        # Plausible but unhelpful response — search returns siblings, not
+        # the exact item we asked about.
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "total_count": 2,
+                "results": [
+                    {
+                        "hash_name": "Manifold Paradox Bundle",
+                        "sell_listings": 9,
+                        "asset_description": {
+                            "market_hash_name": "Manifold Paradox Bundle",
+                            "name": "Manifold Paradox Bundle",
+                            "type": "Bundle",
+                        },
+                    },
+                    {
+                        "hash_name": "Inscribed Manifold Paradox",
+                        "sell_listings": 60,
+                        "asset_description": {
+                            "market_hash_name": "Inscribed Manifold Paradox",
+                            "name": "Inscribed Manifold Paradox",
+                            "type": "Arcana",
+                        },
+                    },
+                ],
+            },
+        )
+
+    with respx.mock(assert_all_called=False) as router:
+        router.get(PRICE_OVERVIEW).mock(return_value=_ok_priceoverview())
+        router.get(SEARCH_URL).mock(side_effect=respond)
+
+        summary = await run_ingestion(
+            items=["Manifold Paradox"],
+            settings=settings,
+            run_id="run-nomatch",
+            now=FIXED_NOW,
+            backend=fake,
+        )
+
+    assert summary.items_failed == 1
+    assert summary.items_quarantined == 0
+    assert summary.items_ok == 0
+
+    # Nothing landed in quarantine — well-formed response, just no match.
+    assert await _count(conn, "quarantine") == 0
+    # And nothing in listing_history.
+    assert await _count(conn, "listing_history") == 0
+    # Strike counter stayed at zero (status_code was None when the
+    # IngestError was raised, so the strike-policy filter dropped it).
+    item_rows = await _select(
+        conn,
+        "SELECT consecutive_ingest_4xx, active FROM items WHERE market_hash = ?",
+        ("Manifold Paradox",),
+    )
+    assert item_rows[0]["consecutive_ingest_4xx"] == 0
+    assert item_rows[0]["active"] == 1
+
+
+@pytest.mark.asyncio
+async def test_client_fetch_listings_picks_exact_hash_name(settings: Settings) -> None:
+    """Client-level pin: when ``search/render`` returns several results
+    sharing a prefix, the one with ``hash_name`` equal to the requested
+    item is what feeds ``listings_count``. Guards against a regression
+    where we'd accidentally take ``results[0]`` (which Steam may rank by
+    relevance, not exact match).
+    """
+    sleep, _ = _make_recorded_sleep()
+    payload = {
+        "success": True,
+        "total_count": 3,
+        "results": [
+            {
+                "hash_name": "Manifold Paradox Bundle",
+                "sell_listings": 9,
+                "asset_description": {
+                    "market_hash_name": "Manifold Paradox Bundle",
+                    "name": "Manifold Paradox Bundle",
+                    "type": "Bundle",
+                },
+            },
+            {
+                "hash_name": "Manifold Paradox",
+                "sell_listings": 176,
+                "asset_description": {
+                    "market_hash_name": "Manifold Paradox",
+                    "name": "Manifold Paradox",
+                    "type": "Arcana",
+                },
+            },
+            {
+                "hash_name": "Inscribed Manifold Paradox",
+                "sell_listings": 60,
+                "asset_description": {
+                    "market_hash_name": "Inscribed Manifold Paradox",
+                    "name": "Inscribed Manifold Paradox",
+                    "type": "Arcana",
+                },
+            },
+        ],
+    }
+
+    with respx.mock(assert_all_called=False) as router:
+        router.get(SEARCH_URL).mock(return_value=httpx.Response(200, json=payload))
+        async with SteamMarketClient(settings, sleep=sleep) as client:
+            result = await client.fetch_listings("Manifold Paradox")
+
+    assert result.listings_count == 176  # the exact-match entry, not the first result
+    assert result.success is True

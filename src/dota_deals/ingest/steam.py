@@ -24,7 +24,6 @@ import random
 from collections.abc import Awaitable, Callable, Mapping
 from types import TracebackType
 from typing import Self, cast
-from urllib.parse import quote
 
 import httpx
 from pydantic import ValidationError
@@ -39,8 +38,23 @@ from dota_deals.models.market import (
 )
 
 _PRICE_OVERVIEW_URL = "https://steamcommunity.com/market/priceoverview/"
-_LISTINGS_URL_TEMPLATE = "https://steamcommunity.com/market/listings/570/{name}/render"
 _SEARCH_URL = "https://steamcommunity.com/market/search/render"
+# The number of search results we ask for when looking up listings for a
+# specific item. The exact ``hash_name`` match is almost always the first
+# result; ``25`` leaves slack for items whose name is a strict prefix of
+# several others (e.g., a hero name matching its bundles and editions)
+# without ballooning per-poll bandwidth.
+_LISTINGS_SEARCH_COUNT = 25
+
+# The old listings endpoint (``/market/listings/<appid>/<name>/render``)
+# returned ``total_count`` JSON. As of mid-2026, Steam migrated the
+# Community frontend to a React SSR architecture and this URL now serves
+# the same HTML shell as the listings *page* — ``format=json`` and every
+# combination of ``Accept`` / ``X-Requested-With`` / browser-UA headers
+# I tried returned the same 600KB HTML body. ``search/render?norender=1``
+# is the only JSON endpoint still exposing per-item listing counts
+# without an authenticated session. See the commit that introduced this
+# constant for the diagnosis.
 _USER_AGENT = "dota-deals/0.1 (+https://github.com/RsdNoob/dota-deals)"
 _MAX_NETWORK_ATTEMPTS = 3
 _MAX_429_ATTEMPTS = 4
@@ -171,40 +185,89 @@ class SteamMarketClient:
             ) from ve
 
     async def fetch_listings(self, item_name: str) -> SteamListingsResponse:
-        """Fetch and validate the listings render response for ``item_name``.
+        """Fetch the active listing count for ``item_name``.
 
-        Same retry / error semantics as :meth:`fetch_price_overview`. Only
-        ``total_count`` is parsed from the response; ``count=1`` is sent to
-        minimize body size since this endpoint is heavier than priceoverview.
+        Same retry / error semantics as :meth:`fetch_price_overview`. Hits
+        ``search/render?norender=1&query=<name>`` (the only JSON
+        endpoint Steam still exposes for per-item listing counts after
+        the React-SSR migration broke the legacy ``/render`` JSON path —
+        see the module-level comment on ``_LISTINGS_SEARCH_COUNT`` for the
+        backstory) and filters the response for an exact ``hash_name``
+        match. The matched result's ``sell_listings`` becomes
+        ``listings_count`` on the returned model.
 
-        :raises IngestError: see :meth:`fetch_price_overview`.
-        :raises IngestValidationError: see :meth:`fetch_price_overview`.
+        :raises IngestError: on a search-side HTTP failure (same shape
+            as ``fetch_price_overview``), or when the search response
+            doesn't contain any result whose ``hash_name`` exactly
+            equals ``item_name``. The "not found" case is treated as
+            a transient failure — no strike, item stays active — since
+            search is fuzzy and may transiently miss an item with zero
+            current listings; universe refresh is the source of truth
+            for deactivation.
+        :raises IngestValidationError: when the response cannot be
+            parsed (e.g., Steam returns HTML).
         """
-        url = _LISTINGS_URL_TEMPLATE.format(name=quote(item_name, safe=""))
         params: Mapping[str, str] = {
+            "appid": "570",
+            "norender": "1",
+            "query": item_name,
             "start": "0",
-            "count": "1",
+            "count": str(_LISTINGS_SEARCH_COUNT),
             "currency": str(self._settings.steam_currency_id),
             "country": self._settings.steam_country,
-            "language": "english",
-            "format": "json",
         }
         raw_text, payload = await self._get_json(
-            url,
+            _SEARCH_URL,
             params=params,
             source="steam_listings",
             item=item_name,
         )
-        try:
-            return SteamListingsResponse.from_raw(payload)
-        except ValidationError as ve:
+
+        # The wire shape we care about for listings is a thin slice of
+        # the broader search response — just the ``results`` array. Drive
+        # validation off it directly rather than routing through
+        # SteamSearchPage so a malformed individual result doesn't fail
+        # the whole call (we only need one exact match to succeed).
+        results_field = payload.get("results")
+        if not isinstance(results_field, list):
             raise IngestValidationError(
                 item=item_name,
                 source="steam_listings",
                 raw_payload=raw_text,
-                error_type=type(ve).__name__,
-                error_message=str(ve),
-            ) from ve
+                error_type="MissingResults",
+                error_message=(
+                    f"search response missing or malformed `results` array: "
+                    f"got {type(results_field).__name__}"
+                ),
+            )
+
+        for entry in results_field:
+            if not isinstance(entry, Mapping):
+                continue
+            if entry.get("hash_name") != item_name:
+                continue
+            sell_listings = entry.get("sell_listings")
+            if not isinstance(sell_listings, int) or sell_listings < 0:
+                raise IngestValidationError(
+                    item=item_name,
+                    source="steam_listings",
+                    raw_payload=raw_text,
+                    error_type="MissingSellListings",
+                    error_message=(
+                        f"matched result missing or malformed `sell_listings`: "
+                        f"got {sell_listings!r}"
+                    ),
+                )
+            return SteamListingsResponse(success=True, listings_count=sell_listings)
+
+        # No exact hash_name match. Surface as IngestError (not validation —
+        # the response was well-formed; the item just wasn't in the page
+        # we asked for) so the runner counts the item as failed but
+        # doesn't quarantine the payload or accrue a strike.
+        raise IngestError(
+            f"search/render returned no exact hash_name match for {item_name!r}",
+            item=item_name,
+        )
 
     async def fetch_search_page(
         self, *, rarity_tag: str, start: int = 0, count: int = 100

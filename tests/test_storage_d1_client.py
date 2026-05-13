@@ -127,8 +127,16 @@ def _make_recorded_sleep() -> tuple[Callable[[float], Awaitable[None]], list[flo
 # ----------------------------- configuration ----------------------------------
 
 
+# ``_env_file=None`` opts these construction-error tests out of .env
+# loading. Without it, a developer who has CLOUDFLARE_* populated in
+# their local .env (a normal state once the real-D1 setup is done) gets
+# Settings filled in from the file and the "missing" field is no longer
+# missing — false negative.
+
+
 def test_missing_account_id_raises_config_error(tmp_path: Path) -> None:
     settings = Settings(
+        _env_file=None,  # type: ignore[call-arg]
         db_path=tmp_path / "x.db",
         cloudflare_d1_database_id=_DATABASE,
         cloudflare_d1_api_token="t",
@@ -140,6 +148,7 @@ def test_missing_account_id_raises_config_error(tmp_path: Path) -> None:
 
 def test_missing_database_id_raises_config_error(tmp_path: Path) -> None:
     settings = Settings(
+        _env_file=None,  # type: ignore[call-arg]
         db_path=tmp_path / "x.db",
         cloudflare_account_id=_ACCOUNT,
         cloudflare_d1_api_token="t",
@@ -151,6 +160,7 @@ def test_missing_database_id_raises_config_error(tmp_path: Path) -> None:
 
 def test_missing_token_raises_config_error(tmp_path: Path) -> None:
     settings = Settings(
+        _env_file=None,  # type: ignore[call-arg]
         db_path=tmp_path / "x.db",
         cloudflare_account_id=_ACCOUNT,
         cloudflare_d1_database_id=_DATABASE,
