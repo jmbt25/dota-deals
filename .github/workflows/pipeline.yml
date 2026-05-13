@@ -1,0 +1,182 @@
+name: pipeline
+
+# Scheduled pipeline: ingest 3×/day, full report 1×/day (the 16:00 UTC run).
+# See docs/DEPLOYMENT.md for the deployment story; Cloudflare Pages picks up
+# the committed `public/data/` automatically via its GitHub integration.
+
+on:
+  schedule:
+    # Every 8 hours, at the same slots Settings.ingest_cadence_hours rounds
+    # to (00:00, 08:00, 16:00 UTC). Cron is in UTC on GHA.
+    - cron: '0 */8 * * *'
+  workflow_dispatch:
+    inputs:
+      skip_ingest:
+        description: "Skip ingest (don't hit Steam). Use to re-run signals/score/publish after a fix."
+        type: boolean
+        default: false
+
+# The workflow commits `public/data/` back to main, so the default
+# GITHUB_TOKEN needs write access. Granting only `contents: write` —
+# nothing else — keeps the blast radius minimal.
+permissions:
+  contents: write
+
+# Don't let two scheduled runs overlap. The 8-hour cron and the <5-minute
+# typical runtime make collisions unlikely, but a stuck previous job +
+# a fresh schedule trigger could otherwise both touch R2 simultaneously.
+concurrency:
+  group: pipeline
+  cancel-in-progress: false
+
+env:
+  # All R2 credentials live in repo secrets (Settings → Secrets and variables
+  # → Actions). The workflow doesn't echo them; only the dota-deals CLI reads
+  # them via pydantic-settings.
+  R2_ENDPOINT:           ${{ secrets.R2_ENDPOINT }}
+  R2_BUCKET:             ${{ secrets.R2_BUCKET }}
+  R2_ACCESS_KEY_ID:      ${{ secrets.R2_ACCESS_KEY_ID }}
+  R2_SECRET_ACCESS_KEY:  ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  # Where the pulled DB lands on the runner. Matches Settings.db_path's
+  # default of ./data/dota_deals.db so no override is needed.
+  DB_PATH:               ./data/dota_deals.db
+  PYTHONUNBUFFERED:      "1"
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Need write history for the chore: publish commit + push.
+          persist-credentials: true
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Compute run flags
+        id: flags
+        # Resolve once at job start so every gated step uses the same hour
+        # (a long-running job that crosses an hour boundary doesn't flip
+        # behavior mid-flight).
+        run: |
+          set -euo pipefail
+          HOUR=$(date -u +%H)
+          IS_MANUAL='${{ github.event_name == 'workflow_dispatch' }}'
+          SKIP_INGEST='${{ inputs.skip_ingest == true }}'
+
+          # Universe: only the 00:00 UTC scheduled run. Manual dispatch
+          # skips it on purpose — the items table is fresh enough from
+          # previous scheduled runs, and a manual rerun shouldn't burn
+          # Steam quota on universe paging.
+          if [ "$HOUR" = "00" ] && [ "$IS_MANUAL" != "true" ]; then
+            RUN_UNIVERSE=true
+          else
+            RUN_UNIVERSE=false
+          fi
+
+          # Ingest runs on every scheduled trigger, and on manual dispatch
+          # unless skip_ingest=true.
+          if [ "$SKIP_INGEST" = "true" ]; then
+            RUN_INGEST=false
+          else
+            RUN_INGEST=true
+          fi
+
+          # Late-day stages (signals/score/publish): only the 16:00 UTC
+          # scheduled run, OR any manual dispatch (manual is "I want a
+          # full report now").
+          if [ "$HOUR" = "16" ] || [ "$IS_MANUAL" = "true" ]; then
+            RUN_LATE=true
+          else
+            RUN_LATE=false
+          fi
+
+          {
+            echo "hour=$HOUR"
+            echo "is_manual=$IS_MANUAL"
+            echo "skip_ingest=$SKIP_INGEST"
+            echo "run_universe=$RUN_UNIVERSE"
+            echo "run_ingest=$RUN_INGEST"
+            echo "run_late=$RUN_LATE"
+          } >> "$GITHUB_OUTPUT"
+
+          # Echo to the run summary for easier debugging in the GHA UI.
+          {
+            echo "## Pipeline flags"
+            echo "| flag | value |"
+            echo "|---|---|"
+            echo "| hour | \`$HOUR\` |"
+            echo "| event | \`${{ github.event_name }}\` |"
+            echo "| is_manual | \`$IS_MANUAL\` |"
+            echo "| skip_ingest | \`$SKIP_INGEST\` |"
+            echo "| run_universe | \`$RUN_UNIVERSE\` |"
+            echo "| run_ingest | \`$RUN_INGEST\` |"
+            echo "| run_late | \`$RUN_LATE\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pull DB from R2
+        id: db_pull
+        run: dota-deals db pull
+
+      - name: Refresh universe
+        if: steps.flags.outputs.run_universe == 'true'
+        run: dota-deals universe refresh
+
+      - name: Generate items.txt from items table
+        if: steps.flags.outputs.run_ingest == 'true'
+        # Generated dynamically so the ingest list always matches what the
+        # universe stage just upserted. Static items.txt would drift.
+        run: dota-deals items list-active > /tmp/items.txt && wc -l /tmp/items.txt
+
+      - name: Ingest
+        if: steps.flags.outputs.run_ingest == 'true'
+        run: dota-deals ingest --items /tmp/items.txt
+
+      - name: Compute signals
+        if: steps.flags.outputs.run_late == 'true'
+        run: dota-deals signals compute
+
+      - name: Score
+        if: steps.flags.outputs.run_late == 'true'
+        run: dota-deals score
+
+      - name: Publish
+        if: steps.flags.outputs.run_late == 'true'
+        run: dota-deals publish --include-items
+
+      - name: Commit & push public/data
+        if: steps.flags.outputs.run_late == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "dota-deals-bot"
+          git config user.email "bot@dota-deals.local"
+          git add public/data/
+          if git diff --cached --quiet; then
+            echo "public/data/ unchanged; skipping commit"
+            echo "* No data changes to commit." >> "$GITHUB_STEP_SUMMARY"
+          else
+            DATE=$(date -u +%Y-%m-%d)
+            TIME=$(date -u +%H:%M)
+            git commit -m "chore: publish report $DATE $TIME UTC"
+            git push origin HEAD:main
+            echo "* Published report at $DATE $TIME UTC." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Push DB to R2
+        # Always run if the pull succeeded — preserves any ingested rows
+        # even if a later stage (signals/score) failed. The .tmp-copy-rename
+        # upload pattern means a no-op push of an unchanged file is safe.
+        if: always() && steps.db_pull.outcome == 'success'
+        run: dota-deals db push

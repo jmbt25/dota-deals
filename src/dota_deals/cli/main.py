@@ -3,6 +3,7 @@
 Sub-commands:
 
 * ``universe refresh`` — refresh the items universe via Steam search.
+* ``items list-active`` — print active ``market_hash_name``s, one per line.
 * ``ingest``           — fetch current prices/listings for the items in a file.
 * ``signals compute``  — compute all four signals for every active item on a date.
 * ``score``            — compose buy scores from signals for a date.
@@ -43,6 +44,7 @@ from dota_deals.scoring.runner import compute_scores_for
 from dota_deals.signals.runner import compute_signals_for
 from dota_deals.storage.db import connect
 from dota_deals.storage.repositories import (
+    active_items,
     items_missing_observation_for_date,
     latest_ingest_run_for_date,
     latest_scores,
@@ -78,6 +80,14 @@ db_app = typer.Typer(
     add_completion=False,
 )
 app.add_typer(db_app, name="db")
+
+items_app = typer.Typer(
+    name="items",
+    help="Inspect the items table.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(items_app, name="items")
 
 
 def _read_items_file(path: Path) -> list[str]:
@@ -433,6 +443,24 @@ def db_push() -> None:
     except FileNotFoundError as e:
         log.error("local DB not found", error=str(e), path=str(settings.db_path))
         raise typer.Exit(code=1) from e
+
+
+@items_app.command("list-active")
+def items_list_active() -> None:
+    """Print every active item's ``market_hash_name``, one per line.
+
+    Designed to be piped into ``dota-deals ingest --items <file>`` so the
+    scheduled workflow can derive the ingest list from the universe stage's
+    output without committing a static ``items.txt``. Output has no header
+    and no trailing whitespace; sorted by ``item_id`` for stable diffs.
+    """
+    settings = load_settings()
+    conn = connect(settings.db_path)
+    try:
+        for item in active_items(conn):
+            typer.echo(item.market_hash)
+    finally:
+        conn.close()
 
 
 def main() -> None:

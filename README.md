@@ -133,12 +133,38 @@ cp public/data/fixtures/health-degraded.json public/data/health.json
 Refresh the browser after each swap. The wire-format contract is documented
 in [`docs/PUBLISH.md`](docs/PUBLISH.md); the fixtures conform to it.
 
+## Deployment
+
+The system runs unattended on **GitHub Actions** (8-hourly cron in
+[.github/workflows/pipeline.yml](.github/workflows/pipeline.yml)) with the
+canonical SQLite DB synced to **Cloudflare R2** between runs. The frontend
+is hosted on **Cloudflare Pages** at
+[dotadeals.com](https://dotadeals.com) (or the project's
+`*.pages.dev` URL until the custom domain is configured).
+
+Full setup — R2 bucket, GitHub secrets, Pages connection, custom domain,
+failure recovery, rolling back a bad publish — is in
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). Setup is one-time; after that
+the pipeline runs on its own.
+
+The scheduled cadence:
+
+| Time (UTC) | What runs |
+|---|---|
+| `00:00` | universe refresh + ingest + db push |
+| `08:00` | ingest + db push |
+| `16:00` | ingest + signals + score + publish + commit `public/data/` + db push |
+
+Manual runs via the Actions tab; a `skip_ingest` toggle lets you re-run
+signals/score/publish against existing data after a fix.
+
 ## Status
 
-**v1 complete; not yet running against real Steam at scale.** All five
-stages are implemented, 103 tests pass, `mypy --strict` is green over
-53 source files. The respx-mocked test suite exercises the full pipeline;
-manual smoke runs against the real Steam endpoints are pending.
+**v1 shipped.** Five stages implemented, scheduled pipeline configured,
+frontend live. The respx-mocked test suite exercises the full pipeline;
+the first scheduled run against real Steam is the system's actual proving
+ground. Expect early runs to surface edge cases — they go to
+[docs/FUTURE.md](docs/FUTURE.md) or directly into fixes.
 
 Warmup is real: from a cold start, the first 14 days produce no signals,
 days 14–29 produce supply-only signals, and `event_proximity` stays
