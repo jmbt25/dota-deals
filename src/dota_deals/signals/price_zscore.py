@@ -23,16 +23,19 @@ Insufficient-history cases (``< 30`` unique window days, or no daily price
 for ``as_of``) emit ``value = None`` with a ``reason`` annotation in
 ``metadata`` — the runner records the row so downstream "data quality"
 reporting can see the gap.
+
+Phase 9c-ii: pure function over a pre-fetched :class:`DataLookup`. Reads
+``data.daily_prices_for(item_id)`` once and partitions the result into
+window vs as-of locally.
 """
 
 from __future__ import annotations
 
-import sqlite3
 import statistics
 from datetime import date, timedelta
 
 from dota_deals.models.domain import Signal
-from dota_deals.storage.repositories import daily_prices
+from dota_deals.signals.dataset import DataLookup
 
 _MIN_HISTORY_DAYS = 30
 _WINDOW_DAYS = 90
@@ -40,25 +43,34 @@ _TRIM_FRACTION = 0.05
 _CLIP_LIMIT = 3.0
 
 
-def compute(conn: sqlite3.Connection, item_id: int, as_of: date) -> Signal:
+def compute(item_id: int, as_of: date, data: DataLookup) -> Signal:
     """Compute the ``price_zscore`` signal for ``item_id`` as of ``as_of``.
 
     Never raises for data-quality reasons — those return a ``value=None``
-    Signal with a descriptive ``reason`` in ``metadata``. Storage errors and
-    other unexpected exceptions are allowed to propagate to the runner.
+    Signal with a descriptive ``reason`` in ``metadata``.
     """
-    history = daily_prices(conn, item_id, days=_WINDOW_DAYS, as_of=as_of - timedelta(days=1))
-    if len(history) < _MIN_HISTORY_DAYS:
+    series = data.daily_prices_for(item_id)
+
+    # Partition into (1) the 90-day window strictly before ``as_of`` and
+    # (2) the as_of-day median (if present). Two passes over a ~95-entry
+    # list — fine.
+    window_start = as_of - timedelta(days=_WINDOW_DAYS)
+    window = [(d, c) for (d, c) in series if window_start <= d < as_of]
+    current_cents: int | None = None
+    for d, c in series:
+        if d == as_of:
+            current_cents = c
+            break
+
+    if len(window) < _MIN_HISTORY_DAYS:
         return _null_signal(
-            item_id, as_of, reason="insufficient_history", days_available=len(history)
+            item_id, as_of, reason="insufficient_history", days_available=len(window)
         )
 
-    current_row = daily_prices(conn, item_id, days=1, as_of=as_of)
-    if not current_row:
+    if current_cents is None:
         return _null_signal(item_id, as_of, reason="no_daily_price_for_as_of")
-    current_cents = current_row[-1][1]
 
-    window_prices = [cents for (_, cents) in history]
+    window_prices = [cents for (_, cents) in window]
 
     trim = int(len(window_prices) * _TRIM_FRACTION)
     sorted_window = sorted(window_prices)

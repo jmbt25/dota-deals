@@ -10,10 +10,7 @@ Algorithm
 ---------
 1. Find the **next event** within 60 days. If none, output ``None`` — the
    signal "does not apply right now", and the scoring layer renormalizes
-   the remaining signal weights accordingly. (SPEC.md originally said
-   ``0.0``; that biased scores toward zero most of the year because events
-   are sparse. The current convention keeps the score's interpretation
-   stable across event-rich and event-poor windows.)
+   the remaining signal weights accordingly.
 2. Compute ``days_until = next_event.start_date - as_of``.
 3. For each **past event of the same kind**, look up the item's daily price at
    ``past_event.start_date - days_until`` (the "start of the comparable
@@ -26,6 +23,13 @@ Algorithm
    need **at least 3 peers with usable past-window data** before emitting
    a value. Below that threshold the signal is null.
 
+Phase 9c-ii: pure function over a pre-fetched :class:`DataLookup`. The
+``DataLookup`` carries ~95 days of daily prices, which deliberately does
+NOT reach back to past TI cycles in v1; past-event windows older than
+that consistently return no data, which is exactly the warmup behavior
+SPEC.md documents. As history accumulates and the prefetch widens, the
+item-level path begins to fire on its own.
+
 Metadata
 --------
 On success, ``metadata`` includes the event id/kind/confidence, the
@@ -37,28 +41,20 @@ downstream display can soften the recommendation.
 
 from __future__ import annotations
 
-import sqlite3
 import statistics
 from datetime import date, timedelta
 
 from dota_deals.models.domain import Signal
 from dota_deals.models.events import EventRecord
-from dota_deals.storage.repositories import (
-    active_items_in_category,
-    daily_prices,
-    get_item_by_id,
-    next_event_within,
-    past_events_of_kind,
-)
+from dota_deals.signals.dataset import DataLookup
 
-_LOOKAHEAD_DAYS = 60
 _MIN_PEERS_WITH_DATA = 3
 _CLIP_LIMIT = 0.5  # fractional change clipped here, then scaled to [-1, 1]
 
 
-def compute(conn: sqlite3.Connection, item_id: int, as_of: date) -> Signal:
+def compute(item_id: int, as_of: date, data: DataLookup) -> Signal:
     """Compute the ``event_proximity`` signal for ``item_id`` as of ``as_of``."""
-    next_event = next_event_within(conn, as_of, days_window=_LOOKAHEAD_DAYS)
+    next_event = data.next_event
     if next_event is None:
         # Convention: no upcoming event → null, not zero. Scoring renormalizes.
         return _signal_with(item_id, as_of, value=None, metadata={"reason": "no_event_within_60d"})
@@ -71,7 +67,7 @@ def compute(conn: sqlite3.Connection, item_id: int, as_of: date) -> Signal:
         "days_until_event": days_until,
     }
 
-    past = past_events_of_kind(conn, next_event.kind, before=as_of)
+    past = data.past_events(next_event.kind)
     if not past:
         return _signal_with(
             item_id,
@@ -80,14 +76,14 @@ def compute(conn: sqlite3.Connection, item_id: int, as_of: date) -> Signal:
             metadata=base_metadata | {"reason": "no_past_events_of_kind"},
         )
 
-    item = get_item_by_id(conn, item_id)
+    item = data.item(item_id)
     if item is None:
         return _signal_with(
             item_id, as_of, value=None, metadata=base_metadata | {"reason": "item_not_found"}
         )
 
     # Item-level first.
-    item_changes = _changes_in_past_windows(conn, item_id, past, days_until)
+    item_changes = _changes_in_past_windows(data, item_id, past, days_until)
     if item_changes:
         median_change = statistics.median(item_changes)
         return _signal_with(
@@ -99,10 +95,10 @@ def compute(conn: sqlite3.Connection, item_id: int, as_of: date) -> Signal:
 
     # Category-level fallback. Need ≥ _MIN_PEERS_WITH_DATA peers with usable
     # past-window data.
-    peers = active_items_in_category(conn, item.category, exclude_item_id=item_id)
+    peers = data.peers(item.category, exclude_item_id=item_id)
     peer_medians: list[float] = []
     for peer in peers:
-        peer_changes = _changes_in_past_windows(conn, peer.item_id, past, days_until)
+        peer_changes = _changes_in_past_windows(data, peer.item_id, past, days_until)
         if peer_changes:
             peer_medians.append(statistics.median(peer_changes))
 
@@ -129,24 +125,23 @@ def compute(conn: sqlite3.Connection, item_id: int, as_of: date) -> Signal:
 
 
 def _changes_in_past_windows(
-    conn: sqlite3.Connection,
+    data: DataLookup,
     item_id: int,
     past_events: list[EventRecord],
     days_until: int,
 ) -> list[float]:
     """Fractional price changes across each ``(past_event.start - days_until,
     past_event.start)`` window. Skips events where either endpoint has no
-    daily price for ``item_id``.
+    daily price for ``item_id`` (the common case in v1, where the prefetch
+    window doesn't reach back to past TI cycles).
     """
     changes: list[float] = []
     for event in past_events:
         window_start = event.start_date - timedelta(days=days_until)
-        start_rows = daily_prices(conn, item_id, days=1, as_of=window_start)
-        end_rows = daily_prices(conn, item_id, days=1, as_of=event.start_date)
-        if not start_rows or not end_rows:
+        start_price = data.daily_price_at(item_id, window_start)
+        end_price = data.daily_price_at(item_id, event.start_date)
+        if start_price is None or end_price is None:
             continue
-        start_price = start_rows[-1][1]
-        end_price = end_rows[-1][1]
         if start_price <= 0:
             continue
         changes.append((end_price - start_price) / start_price)

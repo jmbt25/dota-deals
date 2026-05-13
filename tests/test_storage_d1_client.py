@@ -136,7 +136,7 @@ def _make_recorded_sleep() -> tuple[Callable[[float], Awaitable[None]], list[flo
 
 def test_missing_account_id_raises_config_error(tmp_path: Path) -> None:
     settings = Settings(
-        _env_file=None,  # type: ignore[call-arg]
+        _env_file=None,
         db_path=tmp_path / "x.db",
         cloudflare_d1_database_id=_DATABASE,
         cloudflare_d1_api_token="t",
@@ -148,7 +148,7 @@ def test_missing_account_id_raises_config_error(tmp_path: Path) -> None:
 
 def test_missing_database_id_raises_config_error(tmp_path: Path) -> None:
     settings = Settings(
-        _env_file=None,  # type: ignore[call-arg]
+        _env_file=None,
         db_path=tmp_path / "x.db",
         cloudflare_account_id=_ACCOUNT,
         cloudflare_d1_api_token="t",
@@ -160,7 +160,7 @@ def test_missing_database_id_raises_config_error(tmp_path: Path) -> None:
 
 def test_missing_token_raises_config_error(tmp_path: Path) -> None:
     settings = Settings(
-        _env_file=None,  # type: ignore[call-arg]
+        _env_file=None,
         db_path=tmp_path / "x.db",
         cloudflare_account_id=_ACCOUNT,
         cloudflare_d1_database_id=_DATABASE,
@@ -255,9 +255,13 @@ async def test_batch_sends_all_statements_in_one_request(tmp_path: Path) -> None
             results = await client.batch(statements)
         assert route.call_count == 1
         sent = json.loads(route.calls[0].request.content)
-        assert isinstance(sent, list)
-        assert len(sent) == 3
-        assert sent[0] == {
+        # D1's batch wire shape: ``{"batch": [{"sql": ..., "params": [...]}, ...]}``
+        # (the bare-array form returns HTTP 400 with code 7400 from the
+        # real API — pinned here so the regression can't recur).
+        assert isinstance(sent, dict)
+        assert "batch" in sent
+        assert len(sent["batch"]) == 3
+        assert sent["batch"][0] == {
             "sql": "INSERT INTO items (market_hash) VALUES (?)",
             "params": ["A"],
         }
@@ -288,7 +292,7 @@ async def test_batch_chunks_above_max_batch_size(tmp_path: Path) -> None:
         assert route.call_count == 3
         # Verify chunk shape: the second request carries the 3rd/4th SQL.
         body_two = json.loads(route.calls[1].request.content)
-        assert [s["params"] for s in body_two] == [["C"], ["D"]]
+        assert [s["params"] for s in body_two["batch"]] == [["C"], ["D"]]
         assert len(results) == 5
 
 

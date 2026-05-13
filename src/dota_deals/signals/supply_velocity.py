@@ -15,31 +15,32 @@ Implementation specifics:
 * **``listings_30d_ago == 0``** emits null (can't compute a relative change
   against a zero denominator).
 * **Output** is ``clip(-(today - past) / past, -1, 1)``.
+
+Phase 9c-ii: pure function over a pre-fetched :class:`DataLookup`. Reads
+``data.listings_for(item_id)`` once.
 """
 
 from __future__ import annotations
 
-import sqlite3
 import statistics
 from datetime import UTC, date, datetime, time, timedelta
 
 from dota_deals.models.domain import ListingPoint, Signal
-from dota_deals.storage.repositories import recent_listings
+from dota_deals.signals.dataset import DataLookup
 
-_HISTORY_WINDOW_DAYS = 60
 _MIN_HISTORY_DAYS = 14
 _REFERENCE_OFFSET_DAYS = 30
 _OBS_FOR_MEDIAN = 3
 
 
-def compute(conn: sqlite3.Connection, item_id: int, as_of: date) -> Signal:
+def compute(item_id: int, as_of: date, data: DataLookup) -> Signal:
     """Compute the ``supply_velocity`` signal for ``item_id`` as of ``as_of``.
 
     Returns a :class:`Signal` whose ``value`` is the clipped relative drop,
     or ``None`` with a ``reason`` in ``metadata`` for any insufficient-data
     case (the runner persists the null row so coverage reporting works).
     """
-    listings = recent_listings(conn, item_id, days=_HISTORY_WINDOW_DAYS, as_of=as_of)
+    listings = data.listings_for(item_id)
     if not listings:
         return _null_signal(item_id, as_of, reason="no_listing_history")
 

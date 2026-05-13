@@ -4,16 +4,18 @@ Construction of peer sets is deliberately small (3-4 items) so the expected
 median is computable by eye. Self-exclusion is tested with a fixture where
 including-vs-excluding the target item shifts the median to different values
 — if exclusion silently drops out the math will visibly fail.
+
+Phase 9c-ii: pure function over a :class:`DataLookup`; tests construct the
+peer set and per-item ``LatestObservation`` directly.
 """
 
 from __future__ import annotations
 
-import sqlite3
 from datetime import UTC, date, datetime
 
-from dota_deals.models.domain import Signal
+from dota_deals.models.domain import Item, ItemCategory, LatestObservation, Signal
 from dota_deals.signals import comparables
-from tests.conftest import insert_test_item
+from dota_deals.signals.dataset import DataLookup
 
 AS_OF = date(2026, 5, 13)
 
@@ -21,89 +23,99 @@ AS_OF = date(2026, 5, 13)
 # ----------------------------- helpers -----------------------------------------
 
 
-def _set_latest_observation(
-    conn: sqlite3.Connection,
-    item_id: int,
-    *,
-    lowest_cents: int,
-    listings_count: int | None = 10,
-) -> None:
-    """Stamp the ``latest_observation`` cache directly for test setup."""
-    conn.execute(
-        """
-        INSERT INTO latest_observation (item_id, observed_at, lowest_cents, listings_count)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(item_id) DO UPDATE SET
-            observed_at = excluded.observed_at,
-            lowest_cents = excluded.lowest_cents,
-            listings_count = excluded.listings_count
-        """,
-        (
-            item_id,
-            datetime.combine(AS_OF, datetime.min.time(), tzinfo=UTC).isoformat(),
-            lowest_cents,
-            listings_count,
-        ),
+def _item(item_id: int, *, category: ItemCategory = "arcana") -> Item:
+    return Item(
+        item_id=item_id,
+        market_hash=f"item-{item_id}",
+        name=f"item-{item_id}",
+        category=category,
+        hero=None,
+        first_seen_at=datetime(2026, 1, 1, tzinfo=UTC),
+        last_seen_at=None,
+        active=True,
     )
-    conn.commit()
+
+
+def _obs(item_id: int, *, lowest_cents: int) -> LatestObservation:
+    return LatestObservation(
+        item_id=item_id,
+        observed_at=datetime.combine(AS_OF, datetime.min.time(), tzinfo=UTC),
+        lowest_cents=lowest_cents,
+        listings_count=10,
+    )
+
+
+def _lookup(
+    items: list[Item],
+    observations: dict[int, LatestObservation],
+) -> DataLookup:
+    items_by_category: dict[ItemCategory, list[Item]] = {}
+    for it in items:
+        items_by_category.setdefault(it.category, []).append(it)
+    return DataLookup(
+        as_of=AS_OF,
+        items_by_id={it.item_id: it for it in items},
+        items_by_category=items_by_category,
+        daily_prices={},
+        listings={},
+        latest_observations=observations,
+        next_event=None,
+        past_events_by_kind={},
+    )
 
 
 # ----------------------------- tests -------------------------------------------
 
 
-def test_priced_30_percent_below_three_peers_yields_plus_0_3(
-    db_conn: sqlite3.Connection,
-) -> None:
+def test_priced_30_percent_below_three_peers_yields_plus_0_3() -> None:
     """SPEC: priced 30% below peer median → output +0.3."""
-    target = insert_test_item(db_conn, market_hash="X", category="arcana")
-    p1 = insert_test_item(db_conn, market_hash="P1", category="arcana")
-    p2 = insert_test_item(db_conn, market_hash="P2", category="arcana")
-    p3 = insert_test_item(db_conn, market_hash="P3", category="arcana")
+    target_id = 1
+    target = _item(target_id)
+    peers = [_item(i) for i in (2, 3, 4)]
+    obs = {target_id: _obs(target_id, lowest_cents=7000)} | {
+        p.item_id: _obs(p.item_id, lowest_cents=10000) for p in peers
+    }
 
-    _set_latest_observation(db_conn, target, lowest_cents=7000)  # $70
-    for peer in (p1, p2, p3):
-        _set_latest_observation(db_conn, peer, lowest_cents=10000)  # $100
-
-    signal = comparables.compute(db_conn, target, AS_OF)
+    signal = comparables.compute(target_id, AS_OF, _lookup([target, *peers], obs))
     assert signal.value is not None
     assert abs(signal.value - 0.3) < 1e-9
 
 
-def test_fewer_than_three_peers_returns_null(db_conn: sqlite3.Connection) -> None:
+def test_fewer_than_three_peers_returns_null() -> None:
     """SPEC: <3 peers with a current price → null."""
-    target = insert_test_item(db_conn, market_hash="X", category="arcana")
-    p1 = insert_test_item(db_conn, market_hash="P1", category="arcana")
-    p2 = insert_test_item(db_conn, market_hash="P2", category="arcana")
+    target = _item(1)
+    p1 = _item(2)
+    p2 = _item(3)
+    obs = {
+        target.item_id: _obs(target.item_id, lowest_cents=7000),
+        p1.item_id: _obs(p1.item_id, lowest_cents=10000),
+        p2.item_id: _obs(p2.item_id, lowest_cents=10000),
+    }
 
-    _set_latest_observation(db_conn, target, lowest_cents=7000)
-    _set_latest_observation(db_conn, p1, lowest_cents=10000)
-    _set_latest_observation(db_conn, p2, lowest_cents=10000)
-
-    signal = comparables.compute(db_conn, target, AS_OF)
+    signal = comparables.compute(target.item_id, AS_OF, _lookup([target, p1, p2], obs))
     assert signal.value is None
     assert signal.metadata["reason"] == "insufficient_peers"
     assert signal.metadata["peers_with_price"] == 2
 
 
-def test_peer_without_latest_observation_does_not_count(
-    db_conn: sqlite3.Connection,
-) -> None:
-    """Peers must have an actual observation; the items row alone isn't enough."""
-    target = insert_test_item(db_conn, market_hash="X", category="arcana")
-    p1 = insert_test_item(db_conn, market_hash="P1", category="arcana")
-    p2 = insert_test_item(db_conn, market_hash="P2", category="arcana")
-    insert_test_item(db_conn, market_hash="P3", category="arcana")  # no observation row
+def test_peer_without_latest_observation_does_not_count() -> None:
+    """Peers must have an actual observation; an items entry alone isn't enough."""
+    target = _item(1)
+    p1 = _item(2)
+    p2 = _item(3)
+    p3 = _item(4)  # no observation row
+    obs = {
+        target.item_id: _obs(target.item_id, lowest_cents=7000),
+        p1.item_id: _obs(p1.item_id, lowest_cents=10000),
+        p2.item_id: _obs(p2.item_id, lowest_cents=10000),
+    }
 
-    _set_latest_observation(db_conn, target, lowest_cents=7000)
-    _set_latest_observation(db_conn, p1, lowest_cents=10000)
-    _set_latest_observation(db_conn, p2, lowest_cents=10000)
-
-    signal = comparables.compute(db_conn, target, AS_OF)
+    signal = comparables.compute(target.item_id, AS_OF, _lookup([target, p1, p2, p3], obs))
     assert signal.value is None
     assert signal.metadata["reason"] == "insufficient_peers"
 
 
-def test_self_is_excluded_from_peer_set(db_conn: sqlite3.Connection) -> None:
+def test_self_is_excluded_from_peer_set() -> None:
     """If self leaked into peers, the median would shift and output would change.
 
     Setup: target at 5000, peers at 10000, 30000, 50000.
@@ -115,53 +127,51 @@ def test_self_is_excluded_from_peer_set(db_conn: sqlite3.Connection) -> None:
     - Correct (self-excluded): delta = (5000-30000)/30000 = -0.833…, output
       clipped at +0.833…. Test asserts the latter.
     """
-    target = insert_test_item(db_conn, market_hash="X", category="arcana")
-    p1 = insert_test_item(db_conn, market_hash="P1", category="arcana")
-    p2 = insert_test_item(db_conn, market_hash="P2", category="arcana")
-    p3 = insert_test_item(db_conn, market_hash="P3", category="arcana")
+    target = _item(1)
+    p1 = _item(2)
+    p2 = _item(3)
+    p3 = _item(4)
+    obs = {
+        target.item_id: _obs(target.item_id, lowest_cents=5000),
+        p1.item_id: _obs(p1.item_id, lowest_cents=10000),
+        p2.item_id: _obs(p2.item_id, lowest_cents=30000),
+        p3.item_id: _obs(p3.item_id, lowest_cents=50000),
+    }
 
-    _set_latest_observation(db_conn, target, lowest_cents=5000)
-    _set_latest_observation(db_conn, p1, lowest_cents=10000)
-    _set_latest_observation(db_conn, p2, lowest_cents=30000)
-    _set_latest_observation(db_conn, p3, lowest_cents=50000)
-
-    signal = comparables.compute(db_conn, target, AS_OF)
+    signal = comparables.compute(target.item_id, AS_OF, _lookup([target, p1, p2, p3], obs))
     assert signal.value is not None
     expected = -((5000 - 30000) / 30000)  # peer median EXCLUDING self = 30000
     assert abs(signal.value - expected) < 1e-9
 
 
-def test_peers_from_other_category_are_ignored(db_conn: sqlite3.Connection) -> None:
+def test_peers_from_other_category_are_ignored() -> None:
     """Comparables is category-scoped: an immortal can't be peer to an arcana."""
-    target = insert_test_item(db_conn, market_hash="X", category="arcana")
-    same_category = [
-        insert_test_item(db_conn, market_hash=f"A{i}", category="arcana") for i in range(2)
-    ]
-    other_category = [
-        insert_test_item(db_conn, market_hash=f"I{i}", category="immortal") for i in range(3)
-    ]
-
-    _set_latest_observation(db_conn, target, lowest_cents=7000)
-    for peer in same_category + other_category:
-        _set_latest_observation(db_conn, peer, lowest_cents=10000)
+    target = _item(1, category="arcana")
+    same_category = [_item(i, category="arcana") for i in (2, 3)]
+    other_category = [_item(i, category="immortal") for i in (4, 5, 6)]
+    obs = {target.item_id: _obs(target.item_id, lowest_cents=7000)} | {
+        p.item_id: _obs(p.item_id, lowest_cents=10000) for p in same_category + other_category
+    }
 
     # Only 2 same-category peers → insufficient.
-    signal = comparables.compute(db_conn, target, AS_OF)
+    signal = comparables.compute(
+        target.item_id, AS_OF, _lookup([target, *same_category, *other_category], obs)
+    )
     assert signal.value is None
     assert signal.metadata["reason"] == "insufficient_peers"
     assert signal.metadata["peers_with_price"] == 2
 
 
-def test_returned_signal_carries_correct_metadata(db_conn: sqlite3.Connection) -> None:
-    target = insert_test_item(db_conn, market_hash="X", category="arcana")
-    peers = [insert_test_item(db_conn, market_hash=f"P{i}", category="arcana") for i in range(3)]
-    _set_latest_observation(db_conn, target, lowest_cents=7000)
-    for peer in peers:
-        _set_latest_observation(db_conn, peer, lowest_cents=10000)
+def test_returned_signal_carries_correct_metadata() -> None:
+    target = _item(1)
+    peers = [_item(i) for i in (2, 3, 4)]
+    obs = {target.item_id: _obs(target.item_id, lowest_cents=7000)} | {
+        p.item_id: _obs(p.item_id, lowest_cents=10000) for p in peers
+    }
 
-    signal = comparables.compute(db_conn, target, AS_OF)
+    signal = comparables.compute(target.item_id, AS_OF, _lookup([target, *peers], obs))
     assert isinstance(signal, Signal)
     assert signal.signal_name == "comparables_delta"
     assert signal.computed_for == AS_OF
-    assert signal.item_id == target
+    assert signal.item_id == target.item_id
     assert signal.metadata["peers_with_price"] == 3

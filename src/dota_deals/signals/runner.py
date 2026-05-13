@@ -11,14 +11,18 @@ for the signal computation loop; they emit a ``value=None`` row with the
 exception type in metadata so the day's coverage is fully recorded.
 :class:`StorageError` is NOT caught here — DB-level problems abort the run
 per the architecture's error table.
+
+Phase 9c-ii: rewritten to async. The HTTP round-trip count per run is now
+``O(pages_of_each_bulk_fetch)`` rather than ``O(items * signals)`` —
+typically 6-8 fetches total + one batched signal insert, regardless of
+universe size. See :mod:`dota_deals.signals.dataset` for the
+fetch-once / dispatch-many shape.
 """
 
 from __future__ import annotations
 
-import sqlite3
 from collections.abc import Callable
 from datetime import UTC, date, datetime
-from types import ModuleType
 
 from structlog.stdlib import BoundLogger
 
@@ -31,51 +35,54 @@ from dota_deals.signals import (
     price_zscore,
     supply_velocity,
 )
-from dota_deals.storage.db import StorageError, bootstrap_schema, connect
-from dota_deals.storage.repositories import (
-    active_items,
+from dota_deals.signals.dataset import DataLookup, build_data_lookup
+from dota_deals.storage.db import StorageError
+from dota_deals.storage.db_async import D1Backend, connect
+from dota_deals.storage.repositories_async import (
     insert_run,
-    insert_signal,
+    insert_signals,
     update_run,
 )
 
-# A "signal computer" is a callable that returns a populated :class:`Signal`
-# (with value or None) for a given (item_id, date). Insufficient-data cases
-# are encoded in the returned Signal's metadata, not raised.
-SignalComputeFn = Callable[[sqlite3.Connection, int, date], Signal]
+# A "signal computer" is a pure callable that returns a populated
+# :class:`Signal` (with value or None) for a given (item, date, data).
+# Insufficient-data cases are encoded in the returned Signal's metadata,
+# not raised.
+SignalComputeFn = Callable[[int, date, DataLookup], Signal]
 
-# Module references rather than direct function references so attribute
-# resolution happens at *call* time. Chosen for future signal
-# instrumentation — timing per signal, error rates, fallback frequency, and
-# null-cause distribution are all things we'll want to observe in
-# production. Wrapping ``module.compute`` (replacing it with a decorated
-# version that records metrics, then restoring it) only works when callers
-# resolve the attribute at call time; caching the function reference at
-# import would defeat that.
-_SIGNAL_MODULES: tuple[tuple[SignalName, ModuleType], ...] = (
-    ("price_zscore", price_zscore),
-    ("supply_velocity", supply_velocity),
-    ("event_proximity", event_proximity),
-    ("comparables_delta", comparables),
+
+# Attribute resolution at call time (via module reference) rather than
+# direct function references so a future instrumentation layer can wrap
+# ``module.compute`` once and have every dispatch pick up the wrapper.
+# Caching ``module.compute`` at import would defeat that.
+_SIGNAL_DISPATCH: tuple[tuple[SignalName, SignalComputeFn], ...] = (
+    ("price_zscore", lambda i, d, dl: price_zscore.compute(i, d, dl)),
+    ("supply_velocity", lambda i, d, dl: supply_velocity.compute(i, d, dl)),
+    ("event_proximity", lambda i, d, dl: event_proximity.compute(i, d, dl)),
+    ("comparables_delta", lambda i, d, dl: comparables.compute(i, d, dl)),
 )
 
 
-def compute_signals_for(
+async def compute_signals_for(
     as_of: date,
     settings: Settings,
     *,
     run_id: str,
     parent_run_id: str | None = None,
     now: datetime | None = None,
+    backend: D1Backend | None = None,
 ) -> RunSummary:
     """Compute all four signals for every active item on ``as_of`` (UTC).
 
     :param as_of: UTC date the signals pertain to.
-    :param settings: process settings (DB path).
+    :param settings: process settings (D1 credentials, budget warn).
     :param run_id: UUID4 identifying this signals run.
     :param parent_run_id: optional UUID4 grouping this run with sibling stage
         runs from the same CLI invocation.
     :param now: optional override for the run's wall-clock time.
+    :param backend: test seam. When ``None`` (CLI path), the runner opens
+        a real :class:`D1Client` from ``settings``. Tests pass a
+        :class:`D1FakeClient` instance to keep storage in-memory.
 
     :raises StorageError: on any DB-level failure (the run is marked
         ``failed`` in ``runs`` before re-raise so observability stays clean).
@@ -87,10 +94,8 @@ def compute_signals_for(
         as_of=as_of.isoformat(),
     )
 
-    conn = connect(settings.db_path)
-    try:
-        bootstrap_schema(conn)
-        insert_run(
+    async with connect(settings, backend=backend) as conn:
+        await insert_run(
             conn,
             RunSummary(
                 run_id=run_id,
@@ -110,16 +115,31 @@ def compute_signals_for(
         items_failed = 0
 
         try:
-            for item in active_items(conn):
+            data = await build_data_lookup(conn, as_of)
+            log.info(
+                "data lookup built",
+                items=len(data.items_by_id),
+                next_event_id=data.next_event.event_id if data.next_event else None,
+            )
+
+            # Collect all signals across all items, then batch-write once.
+            # Per-item bookkeeping (items_ok / items_failed) tracks whether
+            # any of the item's four signals had to be replaced by a
+            # synthesized null row from the exception boundary.
+            all_signals: list[Signal] = []
+            for item in sorted(data.items_by_id.values(), key=lambda i: i.item_id):
                 item_log = log.bind(item_id=item.item_id)
-                item_ok = _compute_all_for_item(conn, item, as_of, item_log)
-                if item_ok:
+                item_signals, item_clean = _compute_all_for_item(item, as_of, data, item_log)
+                all_signals.extend(item_signals)
+                if item_clean:
                     items_ok += 1
                 else:
                     items_failed += 1
+
+            await insert_signals(conn, all_signals)
         except StorageError as e:
             log.error("DB error aborting signals run", error=str(e))
-            update_run(
+            await update_run(
                 conn,
                 run_id,
                 status="failed",
@@ -131,7 +151,7 @@ def compute_signals_for(
 
         final_status: RunStatus = "success" if items_failed == 0 else "partial"
         finished_at = datetime.now(UTC)
-        update_run(
+        await update_run(
             conn,
             run_id,
             status=final_status,
@@ -158,34 +178,33 @@ def compute_signals_for(
             items_failed=items_failed,
             notes=None,
         )
-    finally:
-        conn.close()
 
 
 def _compute_all_for_item(
-    conn: sqlite3.Connection,
     item: Item,
     as_of: date,
+    data: DataLookup,
     log: BoundLogger,
-) -> bool:
-    """Compute and persist all four signals for one item.
+) -> tuple[list[Signal], bool]:
+    """Compute all four signals for one item.
 
-    Returns ``True`` if every signal persisted cleanly (a value=None signal
-    counts as clean — we recorded the day for that item); ``False`` if at
-    least one signal had to be replaced with a synthesized null row because
-    its compute raised.
-
-    Re-raises :class:`StorageError`; it's caught at the run level.
+    Returns ``(signals, item_clean)`` where ``signals`` is the list of four
+    Signal rows to persist and ``item_clean`` is ``True`` iff none of them
+    had to be replaced with a synthesized null row because its compute raised.
+    A null Signal from data insufficiency counts as clean — we recorded the
+    day for that item.
     """
+    signals: list[Signal] = []
     item_clean = True
-    for signal_name, module in _SIGNAL_MODULES:
+    for signal_name, compute_fn in _SIGNAL_DISPATCH:
         sig_log = log.bind(signal_name=signal_name)
         try:
-            signal = module.compute(conn, item.item_id, as_of)
-        except StorageError:
-            raise
+            signal = compute_fn(item.item_id, as_of, data)
         except Exception as e:  # documented signal-loop boundary (CLAUDE.md)
-            sig_log.exception("signal compute raised; emitting null", error_type=type(e).__name__)
+            sig_log.exception(
+                "signal compute raised; emitting null",
+                error_type=type(e).__name__,
+            )
             signal = Signal(
                 item_id=item.item_id,
                 computed_for=as_of,
@@ -197,5 +216,5 @@ def _compute_all_for_item(
                 },
             )
             item_clean = False
-        insert_signal(conn, signal)
-    return item_clean
+        signals.append(signal)
+    return signals, item_clean

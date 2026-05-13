@@ -337,7 +337,18 @@ class D1Client:
         # parallelizing would lose that within a single logical batch.
         results: list[D1Result] = []
         for chunk in _chunked(statements, self._max_batch_size):
-            payload = [{"sql": s.sql, "params": _coerce_params(s.params)} for s in chunk]
+            # D1's /query endpoint accepts either ``{"sql": ..., "params": ...}``
+            # for a single statement or ``{"batch": [...]}`` for a multi-
+            # statement transaction. Phase 9a wrongly POSTed a bare array
+            # here (the respx-mocked tests didn't catch it because they
+            # don't validate request shape against the real wire schema);
+            # the Phase 9c-ii real-D1 smoke test surfaced it with code
+            # 7400 "Expected object, received array".
+            payload = {
+                "batch": [
+                    {"sql": s.sql, "params": _coerce_params(s.params)} for s in chunk
+                ]
+            }
             envelope = await self._post_json(
                 "/query",
                 payload,

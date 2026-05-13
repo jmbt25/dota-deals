@@ -13,35 +13,37 @@ Failure modes (return null with ``reason`` in metadata):
 * Fewer than 3 peers with a current price (median wouldn't be meaningful).
 * Peer median == 0 (defensive — schema's CHECK on ``lowest_cents`` prevents
   this in practice, but the formula is undefined either way).
+
+Phase 9c-ii: pure function over a pre-fetched :class:`DataLookup`. The
+peers list comes from the lookup's items-by-category index; peer prices
+come from the latest_observations dict. No DB calls in this module.
 """
 
 from __future__ import annotations
 
-import sqlite3
 import statistics
 from datetime import date
 
 from dota_deals.models.domain import Signal
-from dota_deals.storage.db import StorageError
-from dota_deals.storage.repositories import active_items_in_category, get_item_by_id
+from dota_deals.signals.dataset import DataLookup
 
 _MIN_PEERS = 3
 
 
-def compute(conn: sqlite3.Connection, item_id: int, as_of: date) -> Signal:
+def compute(item_id: int, as_of: date, data: DataLookup) -> Signal:
     """Compute the ``comparables_delta`` signal for ``item_id`` as of ``as_of``."""
-    item = get_item_by_id(conn, item_id)
+    item = data.item(item_id)
     if item is None:
         return _null(item_id, as_of, reason="item_not_found")
 
-    item_price = _latest_lowest_cents(conn, item_id)
+    item_price = data.latest_lowest_cents_for(item_id)
     if item_price is None:
         return _null(item_id, as_of, reason="no_current_price")
 
-    peers = active_items_in_category(conn, item.category, exclude_item_id=item_id)
+    peers = data.peers(item.category, exclude_item_id=item_id)
     peer_prices: list[int] = []
     for peer in peers:
-        price = _latest_lowest_cents(conn, peer.item_id)
+        price = data.latest_lowest_cents_for(peer.item_id)
         if price is not None:
             peer_prices.append(price)
 
@@ -66,18 +68,6 @@ def compute(conn: sqlite3.Connection, item_id: int, as_of: date) -> Signal:
         value=value,
         metadata={"peers_with_price": len(peer_prices)},
     )
-
-
-def _latest_lowest_cents(conn: sqlite3.Connection, item_id: int) -> int | None:
-    """Return the ``lowest_cents`` from ``latest_observation`` for ``item_id``."""
-    try:
-        row = conn.execute(
-            "SELECT lowest_cents FROM latest_observation WHERE item_id = ?",
-            (item_id,),
-        ).fetchone()
-    except sqlite3.Error as e:
-        raise StorageError(f"latest_observation lookup failed for item_id={item_id}: {e}") from e
-    return int(row["lowest_cents"]) if row is not None else None
 
 
 def _null(item_id: int, as_of: date, **metadata: object) -> Signal:

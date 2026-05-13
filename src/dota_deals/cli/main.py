@@ -224,11 +224,13 @@ def signals_compute(
 
     run_id = str(uuid.uuid4())
     log.info("starting signals compute", as_of=as_of.isoformat())
-    summary: RunSummary = compute_signals_for(
-        as_of=as_of,
-        settings=settings,
-        run_id=run_id,
-        parent_run_id=parent_run_id,
+    summary: RunSummary = asyncio.run(
+        compute_signals_for(
+            as_of=as_of,
+            settings=settings,
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+        )
     )
 
     log.info(

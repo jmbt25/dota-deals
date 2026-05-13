@@ -4,36 +4,37 @@ The signal is sensitive to two distinct windows (now and 30d ago), each
 collapsed by ``median(last_3)``. The fixtures here exercise each window
 boundary explicitly: missing observations at one endpoint, zero counts,
 single-point outliers, exact 40 % drop.
+
+Phase 9c-ii: pure function over a pre-fetched :class:`DataLookup`; the
+tests build a list of :class:`ListingPoint` directly rather than seeding
+``listing_history`` rows.
 """
 
 from __future__ import annotations
 
-import sqlite3
 from datetime import UTC, date, datetime, time, timedelta
 
-from dota_deals.models.domain import Signal
+from dota_deals.models.domain import Item, ListingPoint, Signal
 from dota_deals.signals import supply_velocity
-from tests.conftest import insert_test_item
+from dota_deals.signals.dataset import DataLookup
 
 AS_OF = date(2026, 5, 13)
+_ITEM_ID = 1
 
 
 # ----------------------------- helpers -----------------------------------------
 
 
-def _insert_listing(
-    conn: sqlite3.Connection,
-    item_id: int,
-    *,
-    when: datetime,
-    count: int,
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO listing_history (item_id, observed_at, listings_count)
-        VALUES (?, ?, ?)
-        """,
-        (item_id, when.isoformat(), count),
+def _item(item_id: int = _ITEM_ID) -> Item:
+    return Item(
+        item_id=item_id,
+        market_hash=f"item-{item_id}",
+        name=f"item-{item_id}",
+        category="arcana",
+        hero=None,
+        first_seen_at=datetime(2026, 1, 1, tzinfo=UTC),
+        last_seen_at=None,
+        active=True,
     )
 
 
@@ -46,28 +47,37 @@ def _three_slots(day: date) -> list[datetime]:
     ]
 
 
-def _insert_listing_history(
-    conn: sqlite3.Connection,
-    item_id: int,
-    *,
-    daily_counts: dict[date, list[int]],
-) -> None:
-    """Insert listing observations from a ``{date: [counts at 00, 08, 16]}`` map."""
-    for day, counts in daily_counts.items():
-        for slot, count in zip(_three_slots(day), counts, strict=True):
-            _insert_listing(conn, item_id, when=slot, count=count)
-    conn.commit()
+def _listings_from(
+    daily_counts: dict[date, list[int]], item_id: int = _ITEM_ID
+) -> list[ListingPoint]:
+    """Build a sorted-oldest-first :class:`ListingPoint` series from a
+    ``{date: [counts at 00, 08, 16]}`` map.
+    """
+    points: list[ListingPoint] = []
+    for day in sorted(daily_counts):
+        for slot, count in zip(_three_slots(day), daily_counts[day], strict=True):
+            points.append(ListingPoint(item_id=item_id, observed_at=slot, listings_count=count))
+    return points
+
+
+def _lookup(listings: list[ListingPoint]) -> DataLookup:
+    return DataLookup(
+        as_of=AS_OF,
+        items_by_id={_ITEM_ID: _item()},
+        items_by_category={"arcana": [_item()]},
+        daily_prices={},
+        listings={_ITEM_ID: listings},
+        latest_observations={},
+        next_event=None,
+        past_events_by_kind={},
+    )
 
 
 # ----------------------------- tests -------------------------------------------
 
 
-def test_forty_percent_supply_drop_yields_plus_0_4(db_conn: sqlite3.Connection) -> None:
+def test_forty_percent_supply_drop_yields_plus_0_4() -> None:
     """SPEC: 40 % supply drop over 30 days → +0.4."""
-    item_id = insert_test_item(db_conn, market_hash="DROP")
-
-    # 32 days of history. The 30d-ago reference (AS_OF - 30) gets three obs
-    # at 100; today gets three obs at 60.
     daily_counts: dict[date, list[int]] = {}
     for offset in range(32):
         day = AS_OF - timedelta(days=offset)
@@ -75,40 +85,30 @@ def test_forty_percent_supply_drop_yields_plus_0_4(db_conn: sqlite3.Connection) 
             daily_counts[day] = [60, 60, 60]
         else:
             daily_counts[day] = [100, 100, 100]
-    _insert_listing_history(db_conn, item_id, daily_counts=daily_counts)
 
-    signal = supply_velocity.compute(db_conn, item_id, AS_OF)
+    signal = supply_velocity.compute(_ITEM_ID, AS_OF, _lookup(_listings_from(daily_counts)))
     assert signal.value is not None
     assert abs(signal.value - 0.4) < 1e-9
 
 
-def test_flat_supply_returns_zero(db_conn: sqlite3.Connection) -> None:
+def test_flat_supply_returns_zero() -> None:
     """Constant listing count → relative change 0 → output 0."""
-    item_id = insert_test_item(db_conn, market_hash="FLAT")
-
     daily_counts = {AS_OF - timedelta(days=offset): [100, 100, 100] for offset in range(32)}
-    _insert_listing_history(db_conn, item_id, daily_counts=daily_counts)
 
-    signal = supply_velocity.compute(db_conn, item_id, AS_OF)
+    signal = supply_velocity.compute(_ITEM_ID, AS_OF, _lookup(_listings_from(daily_counts)))
     assert signal.value == 0.0
 
 
-def test_under_14_days_history_returns_null(db_conn: sqlite3.Connection) -> None:
-    item_id = insert_test_item(db_conn, market_hash="SHORT")
-
+def test_under_14_days_history_returns_null() -> None:
     daily_counts = {AS_OF - timedelta(days=offset): [100, 100, 100] for offset in range(10)}
-    _insert_listing_history(db_conn, item_id, daily_counts=daily_counts)
 
-    signal = supply_velocity.compute(db_conn, item_id, AS_OF)
+    signal = supply_velocity.compute(_ITEM_ID, AS_OF, _lookup(_listings_from(daily_counts)))
     assert signal.value is None
     assert signal.metadata["reason"] == "insufficient_history"
 
 
-def test_zero_reference_count_returns_null(db_conn: sqlite3.Connection) -> None:
+def test_zero_reference_count_returns_null() -> None:
     """SPEC: ``listings_30d_ago == 0`` → null (can't divide)."""
-    item_id = insert_test_item(db_conn, market_hash="ZERO_REF")
-
-    # 35 days history, but the three obs at AS_OF - 30 are all zero.
     daily_counts: dict[date, list[int]] = {}
     reference_day = AS_OF - timedelta(days=30)
     for offset in range(35):
@@ -119,16 +119,13 @@ def test_zero_reference_count_returns_null(db_conn: sqlite3.Connection) -> None:
             daily_counts[day] = [0, 0, 0]
         else:
             daily_counts[day] = [100, 100, 100]
-    _insert_listing_history(db_conn, item_id, daily_counts=daily_counts)
 
-    signal = supply_velocity.compute(db_conn, item_id, AS_OF)
+    signal = supply_velocity.compute(_ITEM_ID, AS_OF, _lookup(_listings_from(daily_counts)))
     assert signal.value is None
     assert signal.metadata["reason"] == "reference_count_zero"
 
 
-def test_single_observation_outlier_does_not_dominate(
-    db_conn: sqlite3.Connection,
-) -> None:
+def test_single_observation_outlier_does_not_dominate() -> None:
     """SPEC: a single bad-scrape spike must be absorbed by median-of-3.
 
     All 32 days at 100 except today's middle slot at 99999. Without the
@@ -136,8 +133,6 @@ def test_single_observation_outlier_does_not_dominate(
     -1. With the median, today = median([100, 99999, 100]) = 100 and the
     signal is flat 0.
     """
-    item_id = insert_test_item(db_conn, market_hash="OUTLIER")
-
     daily_counts: dict[date, list[int]] = {}
     for offset in range(32):
         day = AS_OF - timedelta(days=offset)
@@ -145,19 +140,16 @@ def test_single_observation_outlier_does_not_dominate(
             daily_counts[day] = [100, 99999, 100]
         else:
             daily_counts[day] = [100, 100, 100]
-    _insert_listing_history(db_conn, item_id, daily_counts=daily_counts)
 
-    signal = supply_velocity.compute(db_conn, item_id, AS_OF)
+    signal = supply_velocity.compute(_ITEM_ID, AS_OF, _lookup(_listings_from(daily_counts)))
     assert signal.value == 0.0
 
 
-def test_returned_signal_carries_correct_metadata(db_conn: sqlite3.Connection) -> None:
-    item_id = insert_test_item(db_conn, market_hash="META")
+def test_returned_signal_carries_correct_metadata() -> None:
     daily_counts = {AS_OF - timedelta(days=offset): [100, 100, 100] for offset in range(32)}
-    _insert_listing_history(db_conn, item_id, daily_counts=daily_counts)
 
-    signal = supply_velocity.compute(db_conn, item_id, AS_OF)
+    signal = supply_velocity.compute(_ITEM_ID, AS_OF, _lookup(_listings_from(daily_counts)))
     assert isinstance(signal, Signal)
     assert signal.signal_name == "supply_velocity"
     assert signal.computed_for == AS_OF
-    assert signal.item_id == item_id
+    assert signal.item_id == _ITEM_ID
