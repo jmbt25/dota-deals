@@ -81,11 +81,18 @@ the commit. Simpler is better here.
 
 1. **Cloudflare → Pages → Create application → Connect to Git.** Choose
    this repo. Branch: `main`.
-2. **Build settings:**
-   - Framework preset: **None** — this is a static site, no build step.
-   - Build command: **(empty)**
-   - Build output directory: **`public`**
-   - Root directory: **(empty / project root)**
+2. **Build settings.** All five fields, including the ones that look
+   optional — Pages will sometimes auto-fill a deploy command based on
+   the framework it detects, and that auto-fill breaks the
+   GitHub-integration flow we want.
+
+   | Field | Value |
+   |---|---|
+   | Framework preset | **None** — this is a static site |
+   | Build command | **(empty)** |
+   | Build output directory | **`public`** |
+   | Root directory | **(empty / project root)** |
+   | Deploy command | **(empty)** — if Pages pre-filled this with `npx wrangler pages deploy public`, clear it. The wrangler path is Option B (see top of this section); clearing the field puts us back on the GitHub integration. |
 3. **Environment variables (Production, required).** Settings → Environment
    variables → Production → Add variable:
 
@@ -179,6 +186,7 @@ diagnose.
 | `network error` from `db pull` / `db push` | Transient Cloudflare blip. | Re-run via workflow_dispatch. The retry loop in `r2.py` handles short blips; a longer outage surfaces here. |
 | Workflow times out at 30m | Probably the ingest hit a sustained 429 storm. | Wait an hour; re-run with `skip_ingest=true` to push out the late-day stages on existing data. |
 | **Pages build fails:** `Package 'dota-deals' requires a different Python: 3.13.3 not in '<3.13,>=3.12'` | Cloudflare Pages saw `pyproject.toml` at the repo root and auto-detected a Python project, then tried to install with its default Python (3.13). The frontend doesn't need any Python deps — the pipeline's pyproject is unrelated. | Set `SKIP_DEPENDENCY_INSTALL=1` in Pages → Settings → Environment variables → Production, then retry the deploy from the Deployments tab. See the "One-time: Cloudflare Pages" section above for the full env-var table. |
+| **Pages deploy fails:** `Executing user deploy command: npx wrangler pages deploy public` → `Must specify a project name.` | Pages auto-filled the **Deploy command** field with a wrangler invocation; without `--project-name` or a `wrangler.toml`, wrangler fails. The wrangler path is Option B; we picked Option A (GitHub integration, no wrangler) at the top of this doc. | Clear the Deploy command field in Pages → Settings → Builds & deployments → Build configurations. Save, retry deployment. With the field empty, Pages copies `public/` to the edge directly — no wrangler, no project-name lookup. |
 
 ## Rolling back a bad publish
 
