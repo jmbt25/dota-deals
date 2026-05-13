@@ -72,12 +72,15 @@ them via `pydantic-settings`. No other auth needed — the workflow's
 
 ## One-time: Cloudflare Pages
 
-We use Cloudflare's **GitHub integration** rather than a `wrangler pages
-deploy` step in a workflow. Reasoning: the pipeline workflow already
-commits to `main` on every full-report run; Pages picks up the commit and
-deploys automatically. Adding a deploy workflow would mean a second token
-to rotate, a second place for things to go wrong, and a deploy that races
-the commit. Simpler is better here.
+We use Cloudflare's **GitHub integration** — the pipeline workflow
+commits to `main`, Pages picks up the commit and deploys. The original
+Phase 8 plan called this "Option A, no wrangler needed", but
+Cloudflare's current Pages UI requires an explicit Deploy command and
+that command is a `wrangler pages deploy` invocation. The integration
+is still automatic in the sense that Pages-the-product still listens to
+git push events; "no wrangler" is no longer reality.
+
+That means we need a Cloudflare API token. The setup below covers it.
 
 1. **Cloudflare → Pages → Create application → Connect to Git.** Choose
    this repo. Branch: `main`.
@@ -106,23 +109,38 @@ the commit. Simpler is better here.
    and `pages_build_output_dir = "public"`. The deploy command then
    reduces to `npx wrangler pages deploy` and wrangler reads the rest.
    The dashboard approach is simpler for a single deployment target.)*
-3. **Environment variables (Production, required).** Settings → Environment
-   variables → Production → Add variable:
+3. **Create a Cloudflare API token** at
+   <https://dash.cloudflare.com/profile/api-tokens>. The auto-injected
+   `CLOUDFLARE_API_TOKEN` that Pages provides to the build environment
+   doesn't have `Pages:Edit` scope, so the wrangler deploy in step 2
+   would fail with `Authentication error [code: 10000]`. A user-created
+   token with the right scope overrides the auto-injected one.
 
-   | Name | Value | Why |
-   |---|---|---|
-   | `SKIP_DEPENDENCY_INSTALL` | `1` | The pipeline's `pyproject.toml` at the repo root makes Cloudflare auto-detect a Python project and try to `pip install .` before serving. The frontend doesn't need Python at all; this tells Pages to skip the install step entirely. Without it, the build fails with `Package 'dota-deals' requires a different Python: 3.13.3 not in '<3.13,>=3.12'`. |
+   - Click **Create Token** → use the **"Cloudflare Pages — Edit"**
+     template, *or* "Create Custom Token" with `Account → Cloudflare
+     Pages → Edit`.
+   - **Account Resources:** Include → your account.
+   - Create. **Copy the token now — Cloudflare shows it exactly once.**
+     Treat it as a real secret (same handling as the R2 keys).
 
-   (Alternative if you can't skip for some reason: set
-   `PYTHON_VERSION=3.12.10` instead. The install will succeed but burn
+4. **Environment variables (Production, required).** Settings → Environment
+   variables → Production → Add variable. Two are required:
+
+   | Name | Value | Type | Why |
+   |---|---|---|---|
+   | `CLOUDFLARE_API_TOKEN` | (paste the token from step 3) | **Encrypted** | Overrides Pages's auto-injected token so wrangler can actually deploy. Without it: `Authentication error [code: 10000]`. |
+   | `SKIP_DEPENDENCY_INSTALL` | `1` | Plain text | The pipeline's `pyproject.toml` at the repo root makes Cloudflare auto-detect a Python project and try to `pip install .` before serving. The frontend doesn't need Python at all; this tells Pages to skip the install step entirely. Without it, the build fails with `Package 'dota-deals' requires a different Python: 3.13.3 not in '<3.13,>=3.12'`. |
+
+   (Alternative to the skip variable if you can't skip for some reason:
+   set `PYTHON_VERSION=3.12.10`. The install will succeed but burn
    build minutes on dependencies the frontend never uses. Prefer the
    skip variable.)
 
-4. **Save and Deploy.** First deploy may serve an empty site if no
+5. **Save and Deploy.** First deploy may serve an empty site if no
    `public/data/*.json` exists yet — that's the cold-start case the
    frontend handles (it'll render the error state at first, then the
    warmup state once the first scheduled run completes).
-5. **Note the `*.pages.dev` URL** Cloudflare gives you. Open it; you
+6. **Note the `*.pages.dev` URL** Cloudflare gives you. Open it; you
    should see the dota-deals UI in error state (no data yet) or warmup
    state (after the first scheduled run).
 
@@ -200,6 +218,7 @@ diagnose.
 | Workflow times out at 30m | Probably the ingest hit a sustained 429 storm. | Wait an hour; re-run with `skip_ingest=true` to push out the late-day stages on existing data. |
 | **Pages build fails:** `Package 'dota-deals' requires a different Python: 3.13.3 not in '<3.13,>=3.12'` | Cloudflare Pages saw `pyproject.toml` at the repo root and auto-detected a Python project, then tried to install with its default Python (3.13). The frontend doesn't need any Python deps — the pipeline's pyproject is unrelated. | Set `SKIP_DEPENDENCY_INSTALL=1` in Pages → Settings → Environment variables → Production, then retry the deploy from the Deployments tab. See the "One-time: Cloudflare Pages" section above for the full env-var table. |
 | **Pages deploy fails:** `Executing user deploy command: npx wrangler pages deploy public` → `Must specify a project name.` | Cloudflare's current Pages UI requires the Deploy command field, and the default `npx wrangler pages deploy public` doesn't include `--project-name`, so wrangler bails. | Set the Deploy command to `npx wrangler pages deploy public --project-name=YOUR_PROJECT_NAME` (substitute the name from the `*.pages.dev` subdomain) in Pages → Settings → Builds & deployments → Build configurations. Save, retry. See the build-settings table above for the full set. |
+| **Pages deploy fails:** `Authentication error [code: 10000]` from wrangler hitting `/accounts/<id>/pages/projects/<name>` | Pages's auto-injected `CLOUDFLARE_API_TOKEN` doesn't have `Pages:Edit` scope, so wrangler can authenticate (the log shows your email) but can't actually push a deployment. | Create a user-managed API token with `Account → Cloudflare Pages → Edit` scope at <https://dash.cloudflare.com/profile/api-tokens>, then set `CLOUDFLARE_API_TOKEN` (Encrypted) in Pages → Settings → Environment variables → Production. The user-set value overrides the auto-injected one. See step 3 of "One-time: Cloudflare Pages" above. |
 
 ## Rolling back a bad publish
 
