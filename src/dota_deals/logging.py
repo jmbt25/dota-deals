@@ -39,14 +39,19 @@ def configure_logging(run_id: str, log_format: LogFormat) -> None:
     else:
         renderer = structlog.dev.ConsoleRenderer(colors=False)
 
+    # ``format_exc_info`` belongs in the JSON path (it stringifies the
+    # exc_info tuple into the event dict), but the ConsoleRenderer does its
+    # own pretty-traceback rendering and warns if both are active. Keep the
+    # chain renderer-appropriate.
     processors: list[Processor] = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        renderer,
     ]
+    if log_format == "json":
+        processors.append(structlog.processors.format_exc_info)
+    processors.append(renderer)
 
     structlog.configure(
         processors=processors,

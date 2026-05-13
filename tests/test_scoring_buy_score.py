@@ -198,7 +198,7 @@ def test_mixed_item_ids_raises() -> None:
 # ----------------------------- rank_top_n -------------------------------------
 
 
-def _bs(item_id: int, score_value: float) -> "BuyScore":
+def _bs(item_id: int, score_value: float) -> BuyScore:
     components: dict[SignalName, float | None] = {
         "price_zscore": 0.0,
         "supply_velocity": 0.0,

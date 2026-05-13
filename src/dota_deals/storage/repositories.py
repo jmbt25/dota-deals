@@ -609,6 +609,47 @@ def signals_for(conn: sqlite3.Connection, item_id: int, on: date) -> list[Signal
     ]
 
 
+def recent_signals(
+    conn: sqlite3.Connection,
+    item_id: int,
+    *,
+    days: int,
+    as_of: date,
+) -> list[Signal]:
+    """Return all signal rows for ``item_id`` over ``[as_of - days + 1, as_of]``.
+
+    Sorted by ``(computed_for, signal_name)`` so per-signal series are
+    reconstructable by a simple group-by in the caller (the publish layer
+    needs this for ItemDetail's signal_series field).
+    """
+    if days < 1:
+        raise ValueError(f"days must be >= 1, got {days}")
+    start_date = as_of - timedelta(days=days - 1)
+    try:
+        rows = conn.execute(
+            """
+            SELECT item_id, computed_for, signal_name, value, metadata_json
+            FROM signals
+            WHERE item_id = ?
+              AND computed_for BETWEEN ? AND ?
+            ORDER BY computed_for, signal_name
+            """,
+            (item_id, start_date.isoformat(), as_of.isoformat()),
+        ).fetchall()
+    except sqlite3.Error as e:
+        raise StorageError(f"recent_signals failed for item_id={item_id}: {e}") from e
+    return [
+        Signal(
+            item_id=row["item_id"],
+            computed_for=date.fromisoformat(row["computed_for"]),
+            signal_name=row["signal_name"],
+            value=row["value"],
+            metadata=json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+        )
+        for row in rows
+    ]
+
+
 # ---- buy_scores ----
 
 

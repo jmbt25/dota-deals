@@ -43,6 +43,14 @@ class Settings(BaseSettings):
 
     log_format: LogFormat = Field(default="console")
 
+    # Cloudflare R2 (S3-compatible). All optional — when unset the R2 client
+    # raises a clear configuration error rather than guessing at endpoints.
+    r2_endpoint: str | None = Field(default=None)
+    r2_bucket: str | None = Field(default=None)
+    r2_access_key_id: str | None = Field(default=None)
+    r2_secret_access_key: str | None = Field(default=None)
+    r2_db_key: str = Field(default="dota_deals.db")
+
     @model_validator(mode="after")
     def _check_cadence_divides_day(self) -> Self:
         """Polling slots must align to a fixed pattern within a UTC day."""
