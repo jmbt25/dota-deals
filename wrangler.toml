@@ -1,0 +1,21 @@
+# Wrangler configuration for dota-deals.
+#
+# Phase 9: only the D1 binding is populated, because that's all
+# `wrangler d1 migrations apply` needs. There is no Worker yet — that
+# arrives in Phase 11, at which point `name`, `compatibility_date`, and
+# the `main` entry point start mattering.
+#
+# `database_id` is the UUID Cloudflare assigns; `database_name` is the
+# human-readable name shown in the dashboard and accepted by the
+# wrangler CLI (e.g. `wrangler d1 migrations apply dota-deals`).
+
+name = "dota-deals"
+compatibility_date = "2026-05-01"
+
+# Default `migrations_dir = "./migrations"` is implicit; the SQL file
+# lives at `migrations/0001_initial.sql` relative to this file.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "dota-deals"
+database_id = "cbd9fdf6-127b-4295-aeb9-5c1ea9aca9a7"

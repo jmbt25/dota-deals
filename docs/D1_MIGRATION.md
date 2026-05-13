@@ -60,26 +60,33 @@ What 9a does **not** touch:
 
 ## Setup
 
+`wrangler` resolves a D1 database name (`dota-deals`) to its UUID via a
+`wrangler.toml` at the repo root — checked in alongside this doc.
+Without that file, `wrangler d1 migrations apply` fails with "No
+configuration file found." The committed `wrangler.toml` only declares
+the D1 binding for now; the Worker `name` / `main` fields start
+mattering in Phase 11.
+
 One-time, before phase 9b:
 
 ```bash
 # Already done — DB exists at id cbd9fdf6-127b-4295-aeb9-5c1ea9aca9a7,
 # region ENAM. Captured here for reproducibility.
-wrangler d1 create dota-deals-prod
+wrangler d1 create dota-deals
 
 # Apply the schema. Idempotent — safe to rerun.
-wrangler d1 migrations apply dota-deals-prod --remote
+wrangler d1 migrations apply dota-deals --remote
 
 # Verify the tables landed.
-wrangler d1 execute dota-deals-prod --remote \
+wrangler d1 execute dota-deals --remote \
     --command "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
 ```
 
 Locally, run against a wrangler-managed SQLite shim:
 
 ```bash
-wrangler d1 migrations apply dota-deals-prod --local
-wrangler d1 execute dota-deals-prod --local \
+wrangler d1 migrations apply dota-deals --local
+wrangler d1 execute dota-deals --local \
     --command "SELECT count(*) FROM items;"
 ```
 
