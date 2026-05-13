@@ -86,11 +86,23 @@ the commit. Simpler is better here.
    - Build command: **(empty)**
    - Build output directory: **`public`**
    - Root directory: **(empty / project root)**
-3. **Save and Deploy.** First deploy may serve an empty site if no
+3. **Environment variables (Production, required).** Settings → Environment
+   variables → Production → Add variable:
+
+   | Name | Value | Why |
+   |---|---|---|
+   | `SKIP_DEPENDENCY_INSTALL` | `1` | The pipeline's `pyproject.toml` at the repo root makes Cloudflare auto-detect a Python project and try to `pip install .` before serving. The frontend doesn't need Python at all; this tells Pages to skip the install step entirely. Without it, the build fails with `Package 'dota-deals' requires a different Python: 3.13.3 not in '<3.13,>=3.12'`. |
+
+   (Alternative if you can't skip for some reason: set
+   `PYTHON_VERSION=3.12.10` instead. The install will succeed but burn
+   build minutes on dependencies the frontend never uses. Prefer the
+   skip variable.)
+
+4. **Save and Deploy.** First deploy may serve an empty site if no
    `public/data/*.json` exists yet — that's the cold-start case the
    frontend handles (it'll render the error state at first, then the
    warmup state once the first scheduled run completes).
-4. **Note the `*.pages.dev` URL** Cloudflare gives you. Open it; you
+5. **Note the `*.pages.dev` URL** Cloudflare gives you. Open it; you
    should see the dota-deals UI in error state (no data yet) or warmup
    state (after the first scheduled run).
 
@@ -166,6 +178,7 @@ diagnose.
 | `ingest run finished status=partial` | Steam returned 4xx/5xx for some items. Not a workflow failure — just a partial day. | Investigate in the next run's run summary; if persistent, check Steam status or the rarity tag values in `ingest/universe.py`. |
 | `network error` from `db pull` / `db push` | Transient Cloudflare blip. | Re-run via workflow_dispatch. The retry loop in `r2.py` handles short blips; a longer outage surfaces here. |
 | Workflow times out at 30m | Probably the ingest hit a sustained 429 storm. | Wait an hour; re-run with `skip_ingest=true` to push out the late-day stages on existing data. |
+| **Pages build fails:** `Package 'dota-deals' requires a different Python: 3.13.3 not in '<3.13,>=3.12'` | Cloudflare Pages saw `pyproject.toml` at the repo root and auto-detected a Python project, then tried to install with its default Python (3.13). The frontend doesn't need any Python deps — the pipeline's pyproject is unrelated. | Set `SKIP_DEPENDENCY_INSTALL=1` in Pages → Settings → Environment variables → Production, then retry the deploy from the Deployments tab. See the "One-time: Cloudflare Pages" section above for the full env-var table. |
 
 ## Rolling back a bad publish
 
