@@ -1,63 +1,116 @@
 # dota-deals
 
-Buy-signal analytics for the Steam Community Market — Dota 2 arcanas and immortals.
+Buy-signal analytics for the Steam Community Market — Dota 2 arcanas and
+immortals. The Steam Market shows a price chart and nothing else; dota-deals
+shows *why* an item is a good buy right now, with every score exposing its
+component signals so you can disagree intelligently. v1 is a fault-tolerant
+pipeline, not a trading strategy.
 
-The Steam Market shows a price chart and nothing else. dota-deals shows *why* an
-item is a good buy right now: priced below its own 90-day baseline, supply
-contracting, or category historically appreciates before a known event. Every
-score exposes its component signals so you can disagree intelligently.
+## How it works
 
-> **Status:** alpha. Scaffold only. The pipeline does not yet make real Steam
-> requests or persist real data. See [docs/SPEC.md](docs/SPEC.md) and
-> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design.
+1. **`universe refresh`** scrapes Steam's market search for the arcana and
+   immortal rarity tags and upserts every result into the `items` table.
+   Items not seen in three consecutive refreshes are deactivated;
+   previously-deactivated items reappearing reactivate.
+2. **`ingest`** hits two Steam endpoints per item — `/market/priceoverview`
+   and `/market/listings/<appid>/<name>/render` — and writes per-poll rows
+   to `price_history`, `listing_history`, and the `latest_observation`
+   cache. Bounded async concurrency, retries, 429 cool-down.
+3. **`signals compute`** runs four statistical signals per active item per
+   UTC date (`price_zscore`, `supply_velocity`, `event_proximity`,
+   `comparables_delta`) and writes one row per `(item, signal_name)` to
+   `signals`.
+4. **`score`** composes the four signals into a single `buy_score` with
+   renormalization for null signals, picks a one-line explanation citing
+   the strongest contributor, and writes to `scores`.
+5. **`report`** reads the top-N from `scores` and renders to stdout
+   (deterministic format) or atomic JSON.
 
-## What's in v1
+Every stage writes a row to `runs` tagged with its `parent_run_id` so an
+end-to-end batch is queryable as a single unit.
 
-- Async ingestion of price + listing snapshots from the Steam Community Market
-  (every 8 hours).
-- Four signals, computed nightly, weighted into a composite buy score:
-  `price_zscore`, `supply_velocity`, `event_proximity`, `comparables_delta`.
-- A JSON file + stdout report with the top 20 candidates and a one-line reason
-  per pick.
-- Forward-fill only — no backfill. From a cold start the pipeline produces no
-  scores for the first 30 days; partial scores thereafter. See "Signal warmup"
-  in [docs/SPEC.md](docs/SPEC.md).
+## Reliability features
 
-## What's not in v1
+Each pattern is implemented at a specific file location and pinned by a
+test. If something looks like it broke, start from the linked test.
 
-- No ML price prediction. Signals are statistical and transparent.
-- No web UI. Output is a JSON file; a frontend is a separate project.
-- No CS:GO/CS2, no item categories beyond arcanas and immortals.
+| Pattern | Implementation | Test that proves it |
+|---|---|---|
+| **Idempotent writes** — every `(item, observed_at)` (or `(item, signal_name, date)` / `(item, date)`) primary key writes once. Reruns are no-ops. | [`storage/repositories.py`](src/dota_deals/storage/repositories.py) (`INSERT OR IGNORE`) | [`test_ingest.py::test_runner_idempotent_double_run`](tests/test_ingest.py), [`test_signals_runner.py::test_idempotent_rerun_does_not_double_write`](tests/test_signals_runner.py), [`test_scoring_runner.py::test_idempotent_rerun_does_not_double_write`](tests/test_scoring_runner.py) |
+| **Quarantine** — bad payloads land in a dead-letter table with the raw bytes, not silently dropped. | [`ingest/runner.py`](src/dota_deals/ingest/runner.py), [`storage/repositories.py::quarantine_record`](src/dota_deals/storage/repositories.py) | [`test_ingest.py::test_runner_validation_routes_to_quarantine`](tests/test_ingest.py) |
+| **Retry/backoff** — 3 attempts with exponential backoff + jitter for timeouts, transport, and 5xx; 4xx is one-shot. | [`ingest/steam.py::_get_json`](src/dota_deals/ingest/steam.py) | [`test_ingest.py::test_client_timeout_retried_then_succeeds`](tests/test_ingest.py), `test_client_5xx_retried`, `test_client_4xx_not_retried` |
+| **429 cool-down** — a 429 trips a process-global ready event; in-flight retries wait for it before re-issuing. Cool-down task has explicit `add_done_callback` so its exceptions don't disappear. | [`ingest/steam.py`](src/dota_deals/ingest/steam.py) (`_trigger_cooldown`, `_on_cooldown_done`) | [`test_ingest.py::test_client_429_extended_backoff`](tests/test_ingest.py) |
+| **Polling-slot truncation** — `observed_at` is `floor(now.hour / cadence) * cadence`, minute/second zeroed. Re-runs in the same slot collide on the PK. | [`ingest/runner.py::slot_for`](src/dota_deals/ingest/runner.py) | [`test_ingest.py::test_slot_for_truncates_to_polling_slot`](tests/test_ingest.py) |
+| **Partial-run propagation** — the scoring stage reads the latest ingest run's status for the date and surfaces "this score's underlying ingest was partial" per row. | [`scoring/runner.py`](src/dota_deals/scoring/runner.py), [`notifier/json_file.py`](src/dota_deals/notifier/json_file.py) | [`test_scoring_runner.py::test_partial_ingest_propagates_to_score_data_quality`](tests/test_scoring_runner.py), `test_item_missing_from_ingest_flagged_in_data_quality` |
+| **3-strike deactivation** — only true 4xx (400-499 except 429) increments the strike counter. Exactly 3 strikes flips `active=0`. Universe refresh reactivates. | [`ingest/runner.py::_record_failure_strike`](src/dota_deals/ingest/runner.py), [`storage/repositories.py::upsert_item`](src/dota_deals/storage/repositories.py) (reactivation in `ON CONFLICT`) | [`test_ingest.py::test_deactivation_fires_at_exactly_three_strikes`](tests/test_ingest.py), [`test_universe.py::test_reactivation_when_item_reappears`](tests/test_universe.py) |
+| **Resumable on crash** — if a prior run wrote part of the signals for a date, rerunning fills in the missing rows without disturbing the existing ones. | [`signals/runner.py`](src/dota_deals/signals/runner.py) (PK + `INSERT OR IGNORE`) | [`test_signals_runner.py::test_resumable_after_partial_prior_run`](tests/test_signals_runner.py) |
+| **Per-signal exception isolation** — one signal's bug emits a null row with the exception class in metadata; other signals and other items continue. | [`signals/runner.py`](src/dota_deals/signals/runner.py) | [`test_signals_runner.py::test_per_item_per_signal_exception_isolated`](tests/test_signals_runner.py) |
+| **Deterministic report format** — the stdout report is pinned byte-for-byte by a golden-string test so accidental drift surfaces immediately. | [`notifier/stdout.py`](src/dota_deals/notifier/stdout.py) | [`test_notifier_stdout.py::test_golden_stdout_two_items`](tests/test_notifier_stdout.py) |
 
-## Local development
+## How to run it
 
-Requires **Python 3.12** (pinned `>=3.12,<3.13`).
+Requires **Python 3.12** (pinned `>=3.12,<3.13`). No secrets needed — Steam
+Market endpoints are public.
 
 ```bash
 python -m venv .venv
-. .venv/bin/activate           # or: .venv\Scripts\activate on Windows
+. .venv/bin/activate            # or .venv\Scripts\activate on Windows
 pip install -e ".[dev]"
-
-make check                     # lint + format check + typecheck + tests
+cp .env.example .env            # then edit if your defaults differ
+make check                      # ruff + ruff format + mypy --strict + pytest
 ```
 
-Available `make` targets:
+Five CLI commands compose the end-to-end pipeline:
 
-| Target | What it does |
-|---|---|
-| `install` | `pip install -e ".[dev]"` |
-| `lint` | `ruff check .` |
-| `typecheck` | `mypy src tests` |
-| `test` | `pytest` |
-| `check` | All of the above |
-| `run` | Placeholder — the CLI is not yet wired up |
+```bash
+dota-deals universe refresh                       # populate the items table
+dota-deals ingest --items items.txt               # fetch prices + listings
+dota-deals signals compute --date 2026-05-12      # 4 signals × N items
+dota-deals score --date 2026-05-12                # compose buy scores
+dota-deals report --date 2026-05-12 --top 20 \
+   --out reports/2026-05-12.json                  # JSON; omit --out for stdout
+```
 
-## Configuration
+Each stage writes one row to `runs` with `kind` and a shared
+`parent_run_id`. To watch what happened:
 
-Copy `.env.example` to `.env` and edit. No secrets are required for v1 — Steam
-Market endpoints are public.
+```sql
+SELECT kind, status, items_ok, items_failed, started_at
+FROM runs
+ORDER BY started_at DESC
+LIMIT 20;
+```
 
-## Project layout
+The operational details (recompute recipes, data-quality fields,
+warmup windows, failure modes in the logs) live in
+[`docs/INGESTION.md`](docs/INGESTION.md), [`docs/UNIVERSE.md`](docs/UNIVERSE.md),
+[`docs/SIGNALS.md`](docs/SIGNALS.md), and
+[`docs/SCORING.md`](docs/SCORING.md).
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for module boundaries, the SQLite
-schema, the error handling table, and the concurrency model.
+## Status
+
+**v1 complete; not yet running against real Steam at scale.** All five
+stages are implemented, 103 tests pass, `mypy --strict` is green over
+53 source files. The respx-mocked test suite exercises the full pipeline;
+manual smoke runs against the real Steam endpoints are pending.
+
+Warmup is real: from a cold start, the first 14 days produce no signals,
+days 14–29 produce supply-only signals, and `event_proximity` stays
+category-fallback-only until the second TI cycle of operation. SPEC.md
+calls this out as the "Signal warmup" trade-off.
+
+## Design docs
+
+- [`docs/SPEC.md`](docs/SPEC.md) — product spec, the four signal formulas,
+  the composite buy-score weights, success criteria.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — module boundaries, the
+  SQLite schema, the error-handling table, the concurrency model.
+- [`docs/SCORING.md`](docs/SCORING.md) — renormalization by example,
+  data_quality fields, the `event_proximity = null` convention.
+
+## What's not built
+
+See [`docs/FUTURE.md`](docs/FUTURE.md) for the post-v1 list: hero-name
+parsing, backtesting harness (success criterion #3), scheduler /
+deployment wiring, web frontend, CS:GO/CS2 expansion. Each entry says
+why it's deferred and what would have to be true to start it.
