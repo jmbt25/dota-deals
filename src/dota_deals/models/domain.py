@@ -36,6 +36,10 @@ class Item(BaseModel):
     first_seen_at: datetime
     last_seen_at: datetime | None
     active: bool
+    # Strikes accumulate when ingest gets a 4xx for the item. 3 consecutive →
+    # deactivation. Reset on any successful ingest or on the next universe
+    # refresh sighting.
+    consecutive_ingest_4xx: int = Field(default=0, ge=0)
 
 
 class PricePoint(BaseModel):

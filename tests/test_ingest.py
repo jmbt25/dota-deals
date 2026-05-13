@@ -340,6 +340,7 @@ async def test_runner_idempotent_double_run(
 
     assert db_conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0] == 1
     assert db_conn.execute("SELECT COUNT(*) FROM listing_history").fetchone()[0] == 1
+    assert db_conn.execute("SELECT COUNT(*) FROM latest_observation").fetchone()[0] == 1
     # Both runs recorded.
     assert db_conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 2
 
@@ -383,3 +384,101 @@ async def test_runner_summary_reflects_mixed_outcomes(
     assert run["items_quarantined"] == 1
     assert run["items_failed"] == 1
     assert run["finished_at"] is not None
+
+
+# ----------------------------- 3-strike deactivation ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_deactivation_fires_at_exactly_three_strikes(
+    settings: Settings, db_conn: sqlite3.Connection
+) -> None:
+    """Phase 4a: 3 consecutive 4xx flips items.active = 0. Not at 2, not at 4."""
+    insert_test_item(db_conn, market_hash="X")
+
+    def _state() -> tuple[int, int]:
+        row = db_conn.execute(
+            "SELECT active, consecutive_ingest_4xx FROM items WHERE market_hash = ?",
+            ("X",),
+        ).fetchone()
+        return int(row["active"]), int(row["consecutive_ingest_4xx"])
+
+    with respx.mock(assert_all_called=False) as router:
+        router.get(PRICE_OVERVIEW).mock(return_value=httpx.Response(404))
+
+        # Strike 1
+        await run_ingestion(items=["X"], settings=settings, run_id="r1", now=FIXED_NOW)
+        assert _state() == (1, 1), "after strike 1: still active, count=1"
+
+        # Strike 2
+        await run_ingestion(items=["X"], settings=settings, run_id="r2", now=FIXED_NOW)
+        assert _state() == (1, 2), "after strike 2: still active, count=2"
+
+        # Strike 3 — deactivation triggers here, not earlier.
+        await run_ingestion(items=["X"], settings=settings, run_id="r3", now=FIXED_NOW)
+        assert _state() == (0, 3), "after strike 3: deactivated, count=3"
+
+        # Strike 4 — counter keeps climbing but active stays 0 (no re-deactivation).
+        await run_ingestion(items=["X"], settings=settings, run_id="r4", now=FIXED_NOW)
+        assert _state() == (0, 4), "after strike 4: still deactivated, count=4"
+
+
+@pytest.mark.asyncio
+async def test_strike_counter_reset_on_success(
+    settings: Settings, db_conn: sqlite3.Connection
+) -> None:
+    """A successful ingest run clears any accumulated strikes."""
+    insert_test_item(db_conn, market_hash="X")
+    # Pre-seed two strikes so a third would deactivate.
+    db_conn.execute("UPDATE items SET consecutive_ingest_4xx = 2 WHERE market_hash = ?", ("X",))
+    db_conn.commit()
+
+    with respx.mock(assert_all_called=False) as router:
+        router.get(PRICE_OVERVIEW).mock(return_value=_ok_priceoverview())
+        router.get(LISTINGS_PATTERN).mock(return_value=_ok_listings(27))
+
+        await run_ingestion(items=["X"], settings=settings, run_id="r-ok", now=FIXED_NOW)
+
+    row = db_conn.execute(
+        "SELECT active, consecutive_ingest_4xx FROM items WHERE market_hash = ?", ("X",)
+    ).fetchone()
+    assert row["active"] == 1
+    assert row["consecutive_ingest_4xx"] == 0
+
+
+def test_non_4xx_failures_do_not_count_as_strikes(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """Only true 4xx (not 429, not 5xx, not timeouts) increment the strike counter.
+
+    Exercises :func:`_record_failure_strike` directly because the alternative
+    paths through ``run_ingestion`` (timeout, 5xx, 429) all involve real
+    retry waits at runner level. The strike-policy contract is a small,
+    standalone branch worth testing in isolation.
+    """
+    from dota_deals.ingest.runner import _record_failure_strike
+    from dota_deals.logging import get_logger
+
+    insert_test_item(db_conn, market_hash="X")
+    row = db_conn.execute("SELECT item_id FROM items WHERE market_hash = ?", ("X",)).fetchone()
+    item_id = int(row["item_id"])
+    log = get_logger("test").bind()
+
+    for status_code in (429, None, 503, 500, 502):
+        _record_failure_strike(db_conn, item_id, True, status_code, log)
+
+    assert (
+        db_conn.execute(
+            "SELECT consecutive_ingest_4xx FROM items WHERE market_hash = ?", ("X",)
+        ).fetchone()["consecutive_ingest_4xx"]
+        == 0
+    ), "429/timeout/5xx must not increment strikes"
+
+    # Sanity: a true 4xx does increment.
+    _record_failure_strike(db_conn, item_id, True, 404, log)
+    assert (
+        db_conn.execute(
+            "SELECT consecutive_ingest_4xx FROM items WHERE market_hash = ?", ("X",)
+        ).fetchone()["consecutive_ingest_4xx"]
+        == 1
+    )

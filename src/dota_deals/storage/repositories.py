@@ -40,7 +40,14 @@ def _row_to_item(row: sqlite3.Row) -> Item:
         first_seen_at=datetime.fromisoformat(row["first_seen_at"]),
         last_seen_at=(datetime.fromisoformat(row["last_seen_at"]) if row["last_seen_at"] else None),
         active=bool(row["active"]),
+        consecutive_ingest_4xx=int(row["consecutive_ingest_4xx"]),
     )
+
+
+_ITEM_COLUMNS = (
+    "item_id, market_hash, name, category, hero, "
+    "first_seen_at, last_seen_at, active, consecutive_ingest_4xx"
+)
 
 
 # ---- items ----
@@ -49,21 +56,63 @@ def _row_to_item(row: sqlite3.Row) -> Item:
 def upsert_item(conn: sqlite3.Connection, item: Item) -> int:
     """Insert ``item`` or update its mutable fields if ``market_hash`` exists.
 
+    Universe-refresh semantics:
+
+    * ``name``, ``category``, ``hero``, ``last_seen_at`` are overwritten with
+      the supplied values (Steam's view wins).
+    * ``active`` is forced to ``1`` — a sighting from the universe stage
+      reactivates a previously deactivated item.
+    * ``consecutive_ingest_4xx`` is reset to ``0`` — the same fresh-start
+      principle: if Steam still serves the item, ingest gets to try again.
+    * ``first_seen_at`` is preserved from the original row.
+
     Returns the resolved ``item_id``.
     """
-    raise NotImplementedError
+    try:
+        conn.execute(
+            """
+            INSERT INTO items
+                (market_hash, name, category, hero,
+                 first_seen_at, last_seen_at, active, consecutive_ingest_4xx)
+            VALUES (?, ?, ?, ?, ?, ?, 1, 0)
+            ON CONFLICT(market_hash) DO UPDATE SET
+                name = excluded.name,
+                category = excluded.category,
+                hero = excluded.hero,
+                last_seen_at = excluded.last_seen_at,
+                active = 1,
+                consecutive_ingest_4xx = 0
+            """,
+            (
+                item.market_hash,
+                item.name,
+                item.category,
+                item.hero,
+                item.first_seen_at.isoformat(),
+                item.last_seen_at.isoformat() if item.last_seen_at else None,
+            ),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        raise IntegrityViolation(
+            f"items upsert failed for market_hash={item.market_hash!r}: {e}"
+        ) from e
+    except sqlite3.Error as e:
+        raise StorageError(f"items upsert failed for market_hash={item.market_hash!r}: {e}") from e
+    # `cursor.lastrowid` is unreliable for ON CONFLICT updates; always query.
+    row = conn.execute(
+        "SELECT item_id FROM items WHERE market_hash = ?", (item.market_hash,)
+    ).fetchone()
+    if row is None:
+        raise StorageError(f"upsert_item: item_id lookup failed for {item.market_hash!r}")
+    return int(row["item_id"])
 
 
 def get_item_by_hash(conn: sqlite3.Connection, market_hash: str) -> Item | None:
     """Return the item with the given ``market_hash`` if present, else ``None``."""
     try:
         row = conn.execute(
-            """
-            SELECT item_id, market_hash, name, category, hero,
-                   first_seen_at, last_seen_at, active
-            FROM items
-            WHERE market_hash = ?
-            """,
+            f"SELECT {_ITEM_COLUMNS} FROM items WHERE market_hash = ?",
             (market_hash,),
         ).fetchone()
     except sqlite3.Error as e:
@@ -72,8 +121,71 @@ def get_item_by_hash(conn: sqlite3.Connection, market_hash: str) -> Item | None:
 
 
 def active_items(conn: sqlite3.Connection) -> list[Item]:
-    """Return all rows in ``items`` with ``active = 1``."""
-    raise NotImplementedError
+    """Return all rows in ``items`` with ``active = 1``, ordered by ``item_id``."""
+    try:
+        rows = conn.execute(
+            f"SELECT {_ITEM_COLUMNS} FROM items WHERE active = 1 ORDER BY item_id"
+        ).fetchall()
+    except sqlite3.Error as e:
+        raise StorageError(f"active_items query failed: {e}") from e
+    return [_row_to_item(row) for row in rows]
+
+
+def increment_ingest_strikes(conn: sqlite3.Connection, item_id: int) -> int:
+    """Increment ``items.consecutive_ingest_4xx`` for ``item_id`` by 1.
+
+    Returns the new strike count. Raises :class:`StorageError` if the item
+    doesn't exist (which would indicate a runner bug — the runner should
+    only call this for items it just looked up).
+    """
+    try:
+        cursor = conn.execute(
+            """
+            UPDATE items
+            SET consecutive_ingest_4xx = consecutive_ingest_4xx + 1
+            WHERE item_id = ?
+            RETURNING consecutive_ingest_4xx
+            """,
+            (item_id,),
+        )
+        row = cursor.fetchone()
+        conn.commit()
+    except sqlite3.Error as e:
+        raise StorageError(f"increment_ingest_strikes failed for item_id={item_id}: {e}") from e
+    if row is None:
+        raise StorageError(f"item_id={item_id} not found in items")
+    return int(row["consecutive_ingest_4xx"])
+
+
+def reset_ingest_strikes(conn: sqlite3.Connection, item_id: int) -> None:
+    """Reset ``items.consecutive_ingest_4xx`` to ``0`` for ``item_id``.
+
+    Idempotent — calling on an item already at zero is a no-op.
+    """
+    try:
+        conn.execute(
+            "UPDATE items SET consecutive_ingest_4xx = 0 WHERE item_id = ?",
+            (item_id,),
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        raise StorageError(f"reset_ingest_strikes failed for item_id={item_id}: {e}") from e
+
+
+def set_item_active(conn: sqlite3.Connection, item_id: int, *, active: bool) -> None:
+    """Flip ``items.active`` for ``item_id``.
+
+    Used by ingest to deactivate items that hit the strike threshold; universe
+    refresh handles reactivation via :func:`upsert_item`.
+    """
+    try:
+        conn.execute(
+            "UPDATE items SET active = ? WHERE item_id = ?",
+            (1 if active else 0, item_id),
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        raise StorageError(f"set_item_active failed for item_id={item_id}: {e}") from e
 
 
 # ---- price_history ----

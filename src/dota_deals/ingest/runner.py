@@ -35,15 +35,23 @@ from dota_deals.models.domain import ListingPoint, PricePoint, RunStatus, RunSum
 from dota_deals.storage.db import bootstrap_schema, connect
 from dota_deals.storage.repositories import (
     get_item_by_hash,
+    increment_ingest_strikes,
     insert_listing_point,
     insert_price_point,
     insert_run,
     quarantine_record,
+    reset_ingest_strikes,
+    set_item_active,
     update_run,
     upsert_latest_observation,
 )
 
 _ItemOutcome = Literal["ok", "quarantined", "failed"]
+
+# 4xx responses for a single item accumulate as "strikes". Once an item has
+# this many consecutive 4xx outcomes, ingest flips ``items.active = 0`` until
+# the next universe refresh reactivates it.
+_INGEST_DEACTIVATION_THRESHOLD = 3
 
 
 @dataclass(frozen=True)
@@ -215,6 +223,7 @@ async def _ingest_one(
             status_code=ie.status_code,
             error=str(ie),
         )
+        _record_failure_strike(conn, item.item_id, item.active, ie.status_code, item_log)
         return _ItemResult(outcome="failed", item_hash=item_hash)
 
     try:
@@ -237,6 +246,7 @@ async def _ingest_one(
             status_code=ie.status_code,
             error=str(ie),
         )
+        _record_failure_strike(conn, item.item_id, item.active, ie.status_code, item_log)
         return _ItemResult(outcome="failed", item_hash=item_hash)
 
     # Steam returned 200s but item may not have prices yet (newly listed).
@@ -268,4 +278,38 @@ async def _ingest_one(
     insert_listing_point(conn, listing_point)
     upsert_latest_observation(conn, price_point, listing_point.listings_count)
 
+    # A successful poll clears any in-flight strikes. Reactivation is the
+    # universe stage's job (per docs/ARCHITECTURE.md); ingest only clears the
+    # counter so a future 4xx run restarts from zero.
+    if item.consecutive_ingest_4xx > 0:
+        reset_ingest_strikes(conn, item.item_id)
+
     return _ItemResult(outcome="ok", item_hash=item_hash)
+
+
+def _record_failure_strike(
+    conn: sqlite3.Connection,
+    item_id: int,
+    item_active: bool,
+    status_code: int | None,
+    item_log: BoundLogger,
+) -> None:
+    """Increment strikes for ``item_id`` if the failure was a true 4xx.
+
+    Per the architecture: only client-side rejections (400-499, excluding 429)
+    count as strikes — timeouts, 5xx, and rate-limits are infrastructure issues
+    and shouldn't punish the item. Deactivation triggers exactly when the new
+    strike count reaches :data:`_INGEST_DEACTIVATION_THRESHOLD` and the item is
+    currently active (so re-counting doesn't re-fire on an already-deactivated
+    item).
+    """
+    if status_code is None or not (400 <= status_code < 500) or status_code == 429:
+        return
+    new_count = increment_ingest_strikes(conn, item_id)
+    if new_count >= _INGEST_DEACTIVATION_THRESHOLD and item_active:
+        set_item_active(conn, item_id, active=False)
+        item_log.warning(
+            "item deactivated after consecutive 4xx",
+            strike_count=new_count,
+            threshold=_INGEST_DEACTIVATION_THRESHOLD,
+        )

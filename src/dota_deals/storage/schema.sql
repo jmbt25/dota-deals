@@ -3,14 +3,15 @@
 
 -- Items being tracked. Universe is built once and refreshed weekly.
 CREATE TABLE IF NOT EXISTS items (
-    item_id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    market_hash    TEXT NOT NULL UNIQUE,                          -- Steam's market_hash_name
-    name           TEXT NOT NULL,
-    category       TEXT NOT NULL CHECK (category IN ('arcana', 'immortal')),
-    hero           TEXT,                                           -- nullable; not every item ties to a hero
-    first_seen_at  TEXT NOT NULL,                                  -- ISO-8601 UTC
-    last_seen_at   TEXT,                                           -- updated each universe refresh
-    active         INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
+    item_id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_hash            TEXT NOT NULL UNIQUE,                  -- Steam's market_hash_name
+    name                   TEXT NOT NULL,
+    category               TEXT NOT NULL CHECK (category IN ('arcana', 'immortal')),
+    hero                   TEXT,                                  -- nullable; not every item ties to a hero
+    first_seen_at          TEXT NOT NULL,                         -- ISO-8601 UTC
+    last_seen_at           TEXT,                                  -- updated each universe refresh
+    active                 INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    consecutive_ingest_4xx INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_ingest_4xx >= 0)
 );
 
 CREATE INDEX IF NOT EXISTS ix_items_category ON items(category);

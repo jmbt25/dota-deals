@@ -2,8 +2,9 @@
 
 Sub-commands:
 
+* ``universe``  — refresh the items universe via Steam search.
 * ``ingest``    — fetch current prices/listings for the items in a file.
-* (Phase 4+) ``universe``, ``signals``, ``score``, ``report``.
+* (Phase 4b+) ``signals``, ``score``, ``report``.
 
 The :data:`app` object is the Typer application; ``[project.scripts]`` in
 ``pyproject.toml`` wires the ``dota-deals`` console script to :func:`main`.
@@ -21,6 +22,7 @@ import typer
 
 from dota_deals.config import Settings, load_settings
 from dota_deals.ingest.runner import run_ingestion
+from dota_deals.ingest.universe import refresh_universe
 from dota_deals.logging import configure_logging, get_logger
 from dota_deals.models.domain import RunSummary
 
@@ -30,6 +32,14 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+
+universe_app = typer.Typer(
+    name="universe",
+    help="Manage the universe of tracked items.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(universe_app, name="universe")
 
 
 def _read_items_file(path: Path) -> list[str]:
@@ -88,6 +98,44 @@ def ingest(
 
     log.info(
         "ingest complete",
+        status=summary.status,
+        items_ok=summary.items_ok,
+        items_quarantined=summary.items_quarantined,
+        items_failed=summary.items_failed,
+    )
+
+    if summary.status == "failed":
+        raise typer.Exit(code=1)
+
+
+@universe_app.command("refresh")
+def universe_refresh() -> None:
+    """Refresh the items table from Steam's market search.
+
+    Discovers every arcana and immortal currently listed for Dota 2 and
+    upserts each into ``items``. Previously deactivated items that reappear
+    are reactivated.
+    """
+    settings = load_settings()
+    parent_run_id = str(uuid.uuid4())
+    configure_logging(run_id=parent_run_id, log_format=settings.log_format)
+    log = get_logger("dota_deals.cli.universe").bind(
+        source="cli",
+        parent_run_id=parent_run_id,
+    )
+
+    run_id = str(uuid.uuid4())
+    log.info("starting universe refresh")
+    summary: RunSummary = asyncio.run(
+        refresh_universe(
+            settings=settings,
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+        )
+    )
+
+    log.info(
+        "universe refresh complete",
         status=summary.status,
         items_ok=summary.items_ok,
         items_quarantined=summary.items_quarantined,

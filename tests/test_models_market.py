@@ -10,3 +10,5 @@ from dota_deals.models import market
 def test_module_imports() -> None:
     assert issubclass(market.SteamPriceOverview, BaseModel)
     assert issubclass(market.SteamListingsResponse, BaseModel)
+    assert issubclass(market.SteamSearchPage, BaseModel)
+    assert issubclass(market.SteamSearchResult, BaseModel)

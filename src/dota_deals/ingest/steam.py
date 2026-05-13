@@ -32,10 +32,15 @@ from structlog.stdlib import BoundLogger
 
 from dota_deals.config import Settings
 from dota_deals.logging import get_logger
-from dota_deals.models.market import SteamListingsResponse, SteamPriceOverview
+from dota_deals.models.market import (
+    SteamListingsResponse,
+    SteamPriceOverview,
+    SteamSearchPage,
+)
 
 _PRICE_OVERVIEW_URL = "https://steamcommunity.com/market/priceoverview/"
 _LISTINGS_URL_TEMPLATE = "https://steamcommunity.com/market/listings/570/{name}/render"
+_SEARCH_URL = "https://steamcommunity.com/market/search/render"
 _USER_AGENT = "dota-deals/0.1 (+https://github.com/RsdNoob/dota-deals)"
 _MAX_NETWORK_ATTEMPTS = 3
 _MAX_429_ATTEMPTS = 4
@@ -201,6 +206,49 @@ class SteamMarketClient:
                 error_message=str(ve),
             ) from ve
 
+    async def fetch_search_page(
+        self, *, rarity_tag: str, start: int = 0, count: int = 100
+    ) -> SteamSearchPage:
+        """Fetch one page of market search results filtered by ``rarity_tag``.
+
+        Uses the ``?norender=1`` form so the response is a JSON ``results``
+        array rather than HTML the client would have to parse. Pagination is
+        the caller's responsibility — increment ``start`` by the size of the
+        returned ``results`` list until ``start >= total_count``.
+
+        :param rarity_tag: undocumented Steam internal, e.g. ``tag_Rarity_Arcana``
+            or ``tag_Rarity_Immortal`` for Dota 2 (appid 570).
+        :param start: zero-based offset into the result set.
+        :param count: page size; Steam caps this somewhere around 100.
+
+        :raises IngestError: see :meth:`fetch_price_overview`.
+        :raises IngestValidationError: see :meth:`fetch_price_overview`.
+        """
+        params: Mapping[str, str] = {
+            "norender": "1",
+            "appid": "570",
+            "category_570_Rarity[]": rarity_tag,
+            "start": str(start),
+            "count": str(count),
+            "currency": str(self._settings.steam_currency_id),
+        }
+        raw_text, payload = await self._get_json(
+            _SEARCH_URL,
+            params=params,
+            source="steam_market_search",
+            item=rarity_tag,
+        )
+        try:
+            return SteamSearchPage.from_raw(payload)
+        except ValidationError as ve:
+            raise IngestValidationError(
+                item=rarity_tag,
+                source="steam_market_search",
+                raw_payload=raw_text,
+                error_type=type(ve).__name__,
+                error_message=str(ve),
+            ) from ve
+
     # ------------------------------------------------------------------ internals
 
     async def _get_json(
@@ -321,17 +369,37 @@ class SteamMarketClient:
             await self._ready.wait()
 
     def _trigger_cooldown(self) -> None:
-        """Schedule a global cooldown if one isn't already in flight."""
+        """Schedule a global cooldown if one isn't already in flight.
+
+        The release task is fire-and-forget. We attach an explicit done-callback
+        so any exception raised inside :meth:`_release_after_cooldown` is logged
+        instead of silently disappearing into ``asyncio``'s "Task exception was
+        never retrieved" warning.
+        """
         if self._ready.is_set():
             self._ready.clear()
-            self._cooldown_task = asyncio.create_task(self._release_after_cooldown())
+            task = asyncio.create_task(self._release_after_cooldown())
+            task.add_done_callback(self._on_cooldown_done)
+            self._cooldown_task = task
+
+    def _on_cooldown_done(self, task: asyncio.Task[None]) -> None:
+        """Surface any non-cancellation exception from the cooldown task."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._log.error(
+                "cooldown release raised",
+                exc_type=type(exc).__name__,
+                error=str(exc),
+            )
 
     async def _release_after_cooldown(self) -> None:
         try:
             await self._sleep(self._settings.cooldown_429_s)
-        except asyncio.CancelledError:
-            raise
         finally:
+            # Always release `_ready` — even on cancellation — so a shutdown
+            # mid-cooldown doesn't leave queued requests blocked forever.
             self._ready.set()
 
 

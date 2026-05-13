@@ -151,3 +151,92 @@ class SteamListingsResponse(BaseModel):
             unparseable.
         """
         return cls.model_validate(payload)
+
+
+class SteamSearchResult(BaseModel):
+    """One row from a ``/market/search/render?norender=1`` response.
+
+    The raw Steam shape carries each item's metadata under
+    ``asset_description``; we flatten that to the three fields we actually
+    need for universe discovery.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    market_hash_name: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    type: str  # display string, e.g. "Arcana" or "Immortal Item"
+
+
+class SteamSearchPage(BaseModel):
+    """One page of a market search response.
+
+    Steam's ``/market/search/render?norender=1`` endpoint returns a list of
+    results with ``total_count`` so callers can paginate by incrementing
+    ``start`` until ``start >= total_count``.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    success: bool
+    start: int = Field(ge=0)
+    pagesize: int = Field(ge=0)
+    total_count: int = Field(ge=0)
+    results: list[SteamSearchResult]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_steam_shape(cls, data: object) -> object:
+        if not isinstance(data, Mapping):
+            return data
+        # Already-normalized shape (test construction) passes through.
+        if "results" not in data:
+            return data
+        raw_results = data.get("results")
+        if not isinstance(raw_results, list):
+            raise ValueError(f"expected `results` to be a list, got {type(raw_results).__name__}")
+        normalized: list[Mapping[str, object]] = []
+        for raw_entry in raw_results:
+            if not isinstance(raw_entry, Mapping):
+                raise ValueError(f"each result must be a mapping, got {type(raw_entry).__name__}")
+            desc = raw_entry.get("asset_description")
+            desc_map: Mapping[str, object] = desc if isinstance(desc, Mapping) else {}
+            market_hash_name = (
+                desc_map.get("market_hash_name")
+                or raw_entry.get("hash_name")
+                or raw_entry.get("name")
+            )
+            display_name = desc_map.get("name") or raw_entry.get("name")
+            type_str = desc_map.get("type") or ""
+            normalized.append(
+                {
+                    "market_hash_name": market_hash_name,
+                    "name": display_name,
+                    "type": type_str,
+                }
+            )
+        return {
+            "success": bool(data.get("success", False)),
+            "start": _coerce_int(data.get("start", 0)),
+            "pagesize": _coerce_int(data.get("pagesize", 0)),
+            "total_count": _coerce_int(data.get("total_count", 0)),
+            "results": normalized,
+        }
+
+    @classmethod
+    def from_raw(cls, payload: Mapping[str, object]) -> Self:
+        """Parse a raw Steam search page response.
+
+        :raises pydantic.ValidationError: if pagination fields are missing or
+            any result is malformed.
+        """
+        return cls.model_validate(payload)
+
+
+def _coerce_int(value: object) -> int:
+    """Convert int-like inputs (Steam mixes ``int`` and string) to ``int``."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return _parse_int_with_commas(value)
+    raise ValueError(f"cannot coerce to int: {value!r}")
