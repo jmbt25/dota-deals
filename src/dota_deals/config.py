@@ -51,6 +51,23 @@ class Settings(BaseSettings):
     r2_secret_access_key: str | None = Field(default=None)
     r2_db_key: str = Field(default="dota_deals.db")
 
+    # Cloudflare D1 (HTTP REST). All four fields below must be set together
+    # for the D1 client to start. The client raises :class:`D1ConfigError`
+    # if any are missing at construction time — keeping the failure at the
+    # configuration boundary rather than the first request.
+    cloudflare_account_id: str | None = Field(default=None)
+    cloudflare_d1_database_id: str | None = Field(default=None)
+    cloudflare_d1_api_token: str | None = Field(default=None)
+
+    # D1 request timeout, seconds. Default 30s — D1 latency p99 is well under
+    # this; the headroom is for cold-start cases and pathological queries.
+    d1_timeout_s: float = Field(default=30.0, gt=0.0)
+
+    # Max statements per batch request. D1's documented practical batch
+    # ceiling is around 100; staying well under it amortizes HTTP latency
+    # without risking the request size cap.
+    d1_max_batch_size: int = Field(default=100, ge=1, le=100)
+
     @model_validator(mode="after")
     def _check_cadence_divides_day(self) -> Self:
         """Polling slots must align to a fixed pattern within a UTC day."""
