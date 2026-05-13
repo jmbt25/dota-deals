@@ -344,11 +344,7 @@ class D1Client:
             # don't validate request shape against the real wire schema);
             # the Phase 9c-ii real-D1 smoke test surfaced it with code
             # 7400 "Expected object, received array".
-            payload = {
-                "batch": [
-                    {"sql": s.sql, "params": _coerce_params(s.params)} for s in chunk
-                ]
-            }
+            payload = {"batch": [{"sql": s.sql, "params": _coerce_params(s.params)} for s in chunk]}
             envelope = await self._post_json(
                 "/query",
                 payload,

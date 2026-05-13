@@ -114,6 +114,35 @@ async def test_get_item_by_hash_missing_returns_none(conn: D1Connection) -> None
 
 
 @pytest.mark.asyncio
+async def test_upsert_items_batch_inserts_and_reactivates(conn: D1Connection) -> None:
+    """Batch insert reuses ON CONFLICT to reactivate previously-deactivated items.
+
+    The universe runner relies on this property: items that disappear are
+    deactivated by ingest's strike rule, but if they reappear in the
+    next universe refresh the same upsert path resets ``active=1`` and
+    zeros the strike counter.
+    """
+    a = await repo.upsert_item(conn, _make_item("A"))
+    await repo.set_item_active(conn, a, active=False)
+    # Bump the strike counter so we can verify it resets to 0.
+    await conn.execute("UPDATE items SET consecutive_ingest_4xx = 3 WHERE item_id = ?", (a,))
+
+    items = [_make_item("A"), _make_item("B"), _make_item("C")]
+    changes = await repo.upsert_items_batch(conn, items)
+    assert changes >= 3  # 1 update + 2 inserts
+
+    after = {i.market_hash: i for i in await repo.active_items(conn)}
+    assert set(after) == {"A", "B", "C"}
+    assert after["A"].active is True
+    assert after["A"].consecutive_ingest_4xx == 0
+
+
+@pytest.mark.asyncio
+async def test_upsert_items_batch_empty_returns_zero(conn: D1Connection) -> None:
+    assert await repo.upsert_items_batch(conn, []) == 0
+
+
+@pytest.mark.asyncio
 async def test_active_items_filters_and_orders(conn: D1Connection) -> None:
     a = await repo.upsert_item(conn, _make_item("Alpha"))
     b = await repo.upsert_item(conn, _make_item("Beta"))
@@ -472,6 +501,42 @@ async def test_signal_null_value_persists(conn: D1Connection) -> None:
     assert len(got) == 1
     assert got[0].value is None
     assert got[0].metadata == {"reason": "insufficient_history"}
+
+
+@pytest.mark.asyncio
+async def test_signals_for_items_on_date_bulk(conn: D1Connection) -> None:
+    """Bulk read returns ``{item_id: list[Signal]}`` for every requested id,
+    with ``[]`` for items with no signals on the date (empty-list contract
+    matches the other bulk reads).
+    """
+    a = await repo.upsert_item(conn, _make_item("A"))
+    b = await repo.upsert_item(conn, _make_item("B"))
+    c = await repo.upsert_item(conn, _make_item("C"))
+    on = date(2026, 5, 1)
+    other = date(2026, 5, 2)
+
+    await repo.insert_signals(
+        conn,
+        [
+            Signal(item_id=a, computed_for=on, signal_name="price_zscore", value=0.5),
+            Signal(item_id=a, computed_for=on, signal_name="supply_velocity", value=0.3),
+            # b has signals but only on a different date → bulk read for `on` returns [].
+            Signal(item_id=b, computed_for=other, signal_name="price_zscore", value=0.1),
+            # c has none.
+        ],
+    )
+
+    out = await repo.signals_for_items_on_date(conn, [a, b, c], on)
+    assert [s.signal_name for s in out[a]] == ["price_zscore", "supply_velocity"]
+    assert out[b] == []
+    assert out[c] == []
+
+
+@pytest.mark.asyncio
+async def test_signals_for_items_on_date_empty_input(conn: D1Connection) -> None:
+    """Empty item_ids → empty dict, no query issued."""
+    out = await repo.signals_for_items_on_date(conn, [], date(2026, 5, 1))
+    assert out == {}
 
 
 # ----------------------------- scores -----------------------------------------

@@ -21,11 +21,15 @@ is what currently produces the right item universe for Dota 2; if Steam ever
 renames them the universe stage stops producing results and an operator will
 need to discover the new values via the Steam UI ("Filter results" panel)
 and update the mapping here.
+
+Phase 9c-iii: storage moves to D1. Per-page result lists are upserted via
+:func:`upsert_items_batch` rather than item-by-item — at ~500-800 items per
+refresh the per-item HTTP round-trip pattern would push the refresh past
+30 seconds.
 """
 
 from __future__ import annotations
 
-import sqlite3
 from datetime import UTC, datetime
 
 from structlog.stdlib import BoundLogger
@@ -38,12 +42,12 @@ from dota_deals.ingest.steam import (
 )
 from dota_deals.logging import get_logger
 from dota_deals.models.domain import Item, ItemCategory, RunStatus, RunSummary
-from dota_deals.storage.db import bootstrap_schema, connect
-from dota_deals.storage.repositories import (
+from dota_deals.storage.db_async import D1Backend, D1Connection, connect
+from dota_deals.storage.repositories_async import (
     insert_run,
     quarantine_record,
     update_run,
-    upsert_item,
+    upsert_items_batch,
 )
 
 # Undocumented Steam rarity tags. See the module docstring for the source of
@@ -69,20 +73,21 @@ async def refresh_universe(
     parent_run_id: str | None = None,
     now: datetime | None = None,
     page_size: int = _DEFAULT_PAGE_SIZE,
+    backend: D1Backend | None = None,
 ) -> RunSummary:
     """Discover and upsert every arcana and immortal Steam currently lists.
 
     Iterates the two rarity tags, paginating each until ``start >= total_count``.
-    Each result is upserted into ``items`` via :func:`upsert_item`, which
-    resets the strike counter and forces ``active=1`` (so previously
-    deactivated items get reactivated on sighting).
+    Each page's results are batch-upserted into ``items`` via
+    :func:`upsert_items_batch`, which resets the strike counter and forces
+    ``active=1`` (so previously deactivated items get reactivated on sighting).
 
     Per-category failures (network exhausted, non-retriable HTTP) count as
     one ``items_failed`` each; validation failures route the offending page
     body to ``quarantine`` and count as one ``items_quarantined``. The run
     continues across categories regardless of failures.
 
-    :param settings: process settings (concurrency, timeouts, DB path).
+    :param settings: process settings (concurrency, timeouts, D1 credentials).
     :param run_id: UUID4 identifying this universe-refresh run.
     :param parent_run_id: optional UUID4 grouping this run with sibling
         stage runs from the same CLI invocation.
@@ -90,6 +95,8 @@ async def refresh_universe(
         this for determinism. Defaults to :func:`datetime.now` (UTC).
     :param page_size: passed straight through to
         :meth:`SteamMarketClient.fetch_search_page`. Default 100.
+    :param backend: test seam. ``None`` (CLI path) opens a real D1Client;
+        tests pass a D1FakeClient.
     """
     started_at = now if now is not None else datetime.now(UTC)
     log = get_logger("dota_deals.ingest.universe").bind(
@@ -97,10 +104,8 @@ async def refresh_universe(
         run_id=run_id,
     )
 
-    conn = connect(settings.db_path)
-    try:
-        bootstrap_schema(conn)
-        insert_run(
+    async with connect(settings, backend=backend) as conn:
+        await insert_run(
             conn,
             RunSummary(
                 run_id=run_id,
@@ -136,7 +141,7 @@ async def refresh_universe(
                     items_ok += upserted
                     cat_log.info("category complete", items_discovered=upserted)
                 except IngestValidationError as ve:
-                    quarantine_record(
+                    await quarantine_record(
                         conn,
                         run_id=run_id,
                         source=ve.source,
@@ -155,7 +160,7 @@ async def refresh_universe(
             "success" if items_quarantined == 0 and items_failed == 0 else "partial"
         )
         finished_at = datetime.now(UTC)
-        update_run(
+        await update_run(
             conn,
             run_id,
             status=final_status,
@@ -184,21 +189,23 @@ async def refresh_universe(
             items_failed=items_failed,
             notes=None,
         )
-    finally:
-        conn.close()
 
 
 async def _discover_category(
     *,
     client: SteamMarketClient,
-    conn: sqlite3.Connection,
+    conn: D1Connection,
     category: ItemCategory,
     rarity_tag: str,
     now: datetime,
     page_size: int,
     log: BoundLogger,
 ) -> int:
-    """Paginate one category, upserting each result. Returns count of upserts."""
+    """Paginate one category, batch-upserting each page. Returns total count
+    of upsert *attempts* (every result Steam returned), not D1's
+    rows-changed count — the latter is 0 when items already exist with the
+    same fields, but the universe runner's success metric is "we saw it".
+    """
     upserted = 0
     start = 0
     page_number = 0
@@ -221,9 +228,9 @@ async def _discover_category(
         if not page.results:
             return upserted
 
-        for result in page.results:
-            item = Item(
-                item_id=0,  # ignored by upsert_item
+        page_items = [
+            Item(
+                item_id=0,  # ignored by upsert_items_batch
                 market_hash=result.market_hash_name,
                 name=result.name,
                 category=category,
@@ -233,8 +240,10 @@ async def _discover_category(
                 active=True,
                 consecutive_ingest_4xx=0,
             )
-            upsert_item(conn, item)
-            upserted += 1
+            for result in page.results
+        ]
+        await upsert_items_batch(conn, page_items)
+        upserted += len(page_items)
 
         start += len(page.results)
         if start >= page.total_count:

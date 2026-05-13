@@ -12,12 +12,15 @@ Covers the cases enumerated in the Phase 4a brief:
 
 Search-endpoint mocking matches by the ``category_570_Rarity[]`` query param
 so a single respx route can serve both rarities with different bodies.
+
+Phase 9c-iii: storage moves to async D1. Tests use the ``db_conn_async``
+fixture and pass ``backend=fake`` to :func:`refresh_universe`.
 """
 
 from __future__ import annotations
 
-import sqlite3
 from collections.abc import Callable
+from typing import Any
 
 import httpx
 import pytest
@@ -25,6 +28,8 @@ import respx
 
 from dota_deals.config import Settings
 from dota_deals.ingest.universe import refresh_universe
+from dota_deals.storage.db_async import D1Connection
+from tests._d1_fake import D1FakeClient
 
 SEARCH_URL = "https://steamcommunity.com/market/search/render"
 
@@ -75,14 +80,28 @@ def _router_by_tag(
     return dispatch
 
 
+async def _select(
+    conn: D1Connection, sql: str, params: tuple[Any, ...] = ()
+) -> list[dict[str, Any]]:
+    result = await conn.query(sql, params)
+    return result.results
+
+
+async def _count(conn: D1Connection, table: str) -> int:
+    rows = await _select(conn, f"SELECT count(*) AS n FROM {table}")
+    return int(rows[0]["n"])
+
+
 # ----------------------------- happy path & pagination -------------------------
 
 
 @pytest.mark.asyncio
 async def test_happy_path_single_page_per_rarity(
-    settings: Settings, db_conn: sqlite3.Connection
+    settings: Settings,
+    db_conn_async: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 1: each rarity returns one page; every result upserts into items."""
+    conn, fake = db_conn_async
     arcana_page = _page(
         total_count=2,
         start=0,
@@ -100,17 +119,20 @@ async def test_happy_path_single_page_per_rarity(
     with respx.mock(assert_all_called=False) as router:
         router.get(SEARCH_URL).mock(side_effect=_router_by_tag(arcana_page, immortal_page))
 
-        summary = await refresh_universe(settings=settings, run_id="u-1", parent_run_id="parent-1")
+        summary = await refresh_universe(
+            settings=settings, run_id="u-1", parent_run_id="parent-1", backend=fake
+        )
 
     assert summary.status == "success"
     assert summary.items_ok == 3
     assert summary.items_failed == 0
     assert summary.items_quarantined == 0
 
-    rows = db_conn.execute(
+    rows = await _select(
+        conn,
         "SELECT market_hash, category, active, consecutive_ingest_4xx FROM items "
-        "ORDER BY market_hash"
-    ).fetchall()
+        "ORDER BY market_hash",
+    )
     assert [(r["market_hash"], r["category"]) for r in rows] == [
         ("Demon Eater", "arcana"),
         ("Manifold Paradox", "arcana"),
@@ -122,25 +144,15 @@ async def test_happy_path_single_page_per_rarity(
 
 @pytest.mark.asyncio
 async def test_pagination_terminates_when_start_reaches_total_count(
-    settings: Settings, db_conn: sqlite3.Connection
+    settings: Settings,
+    db_conn_async: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 2: three pages of two arcanas each (total_count=6), one page of immortals."""
+    conn, fake = db_conn_async
     arcana_pages = [
-        _page(
-            total_count=6,
-            start=0,
-            results=[_result(f"Arc{i}") for i in range(2)],
-        ),
-        _page(
-            total_count=6,
-            start=2,
-            results=[_result(f"Arc{i}") for i in range(2, 4)],
-        ),
-        _page(
-            total_count=6,
-            start=4,
-            results=[_result(f"Arc{i}") for i in range(4, 6)],
-        ),
+        _page(total_count=6, start=0, results=[_result(f"Arc{i}") for i in range(2)]),
+        _page(total_count=6, start=2, results=[_result(f"Arc{i}") for i in range(2, 4)]),
+        _page(total_count=6, start=4, results=[_result(f"Arc{i}") for i in range(4, 6)]),
     ]
     immortal_page = _page(total_count=0, start=0, results=[])  # zero immortals — still a valid page
 
@@ -150,11 +162,11 @@ async def test_pagination_terminates_when_start_reaches_total_count(
     with respx.mock(assert_all_called=False) as router:
         router.get(SEARCH_URL).mock(side_effect=_router_by_tag(arcana_dispatch, immortal_page))
 
-        summary = await refresh_universe(settings=settings, run_id="u-2", page_size=2)
+        summary = await refresh_universe(settings=settings, run_id="u-2", page_size=2, backend=fake)
 
     assert summary.items_ok == 6
     assert summary.status == "success"
-    assert db_conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 6
+    assert await _count(conn, "items") == 6
     # Pagination consumed exactly the three arcana pages, no fourth fetch.
     assert arcana_pages == []
 
@@ -164,9 +176,11 @@ async def test_pagination_terminates_when_start_reaches_total_count(
 
 @pytest.mark.asyncio
 async def test_4xx_on_one_rarity_partials_the_run(
-    settings: Settings, db_conn: sqlite3.Connection
+    settings: Settings,
+    db_conn_async: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 3: 404 on arcanas → that category fails; immortals still upsert."""
+    conn, fake = db_conn_async
     immortal_page = _page(
         total_count=1, start=0, results=[_result("Riptide Raider", type_="Immortal Item")]
     )
@@ -174,7 +188,7 @@ async def test_4xx_on_one_rarity_partials_the_run(
     with respx.mock(assert_all_called=False) as router:
         router.get(SEARCH_URL).mock(side_effect=_router_by_tag(httpx.Response(404), immortal_page))
 
-        summary = await refresh_universe(settings=settings, run_id="u-3")
+        summary = await refresh_universe(settings=settings, run_id="u-3", backend=fake)
 
     assert summary.status == "partial"
     assert summary.items_ok == 1
@@ -182,15 +196,17 @@ async def test_4xx_on_one_rarity_partials_the_run(
     assert summary.items_quarantined == 0
 
     # The good rarity still landed in items.
-    items = db_conn.execute("SELECT market_hash, category FROM items").fetchall()
+    items = await _select(conn, "SELECT market_hash, category FROM items")
     assert [(r["market_hash"], r["category"]) for r in items] == [("Riptide Raider", "immortal")]
 
 
 @pytest.mark.asyncio
 async def test_malformed_response_routes_to_quarantine(
-    settings: Settings, db_conn: sqlite3.Connection
+    settings: Settings,
+    db_conn_async: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 4: a JSON body that doesn't match the search schema is quarantined."""
+    conn, fake = db_conn_async
     bad_page = httpx.Response(
         200,
         json={
@@ -206,16 +222,17 @@ async def test_malformed_response_routes_to_quarantine(
     with respx.mock(assert_all_called=False) as router:
         router.get(SEARCH_URL).mock(side_effect=_router_by_tag(bad_page, immortal_page))
 
-        summary = await refresh_universe(settings=settings, run_id="u-4")
+        summary = await refresh_universe(settings=settings, run_id="u-4", backend=fake)
 
     assert summary.status == "partial"
     assert summary.items_quarantined == 1
     assert summary.items_ok == 0
 
-    q_rows = db_conn.execute(
+    q_rows = await _select(
+        conn,
         "SELECT source, item_hash, error_type FROM quarantine WHERE run_id = ?",
         ("u-4",),
-    ).fetchall()
+    )
     assert len(q_rows) == 1
     assert q_rows[0]["source"] == "steam_market_search"
     assert q_rows[0]["item_hash"] is None  # category-level failure, not item-level
@@ -226,10 +243,12 @@ async def test_malformed_response_routes_to_quarantine(
 
 @pytest.mark.asyncio
 async def test_reactivation_when_item_reappears(
-    settings: Settings, db_conn: sqlite3.Connection
+    settings: Settings,
+    db_conn_async: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 6: deactivated item with strikes is reactivated and counter resets."""
-    db_conn.execute(
+    conn, fake = db_conn_async
+    await conn.execute(
         """
         INSERT INTO items (
             market_hash, name, category, hero, first_seen_at,
@@ -239,7 +258,6 @@ async def test_reactivation_when_item_reappears(
         """,
         ("Manifold Paradox", "Manifold Paradox", "arcana", None, "2025-01-01T00:00:00+00:00"),
     )
-    db_conn.commit()
 
     arcana_page = _page(
         total_count=1, start=0, results=[_result("Manifold Paradox", type_="Arcana")]
@@ -249,11 +267,12 @@ async def test_reactivation_when_item_reappears(
     with respx.mock(assert_all_called=False) as router:
         router.get(SEARCH_URL).mock(side_effect=_router_by_tag(arcana_page, immortal_page))
 
-        await refresh_universe(settings=settings, run_id="u-5")
+        await refresh_universe(settings=settings, run_id="u-5", backend=fake)
 
-    row = db_conn.execute(
+    rows = await _select(
+        conn,
         "SELECT active, consecutive_ingest_4xx FROM items WHERE market_hash = ?",
         ("Manifold Paradox",),
-    ).fetchone()
-    assert row["active"] == 1
-    assert row["consecutive_ingest_4xx"] == 0
+    )
+    assert rows[0]["active"] == 1
+    assert rows[0]["consecutive_ingest_4xx"] == 0

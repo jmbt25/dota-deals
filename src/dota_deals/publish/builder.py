@@ -1,24 +1,32 @@
 """Builders for the wire-format JSON payloads.
 
-Each function is read-only against the SQLite DB and returns a fully
-populated wire model (or ``None`` for the historical/per-item lookups
-when the entity doesn't exist). The "latest" and "health" builders
-never raise on empty state — they describe the warmup case explicitly,
-since the frontend depends on that contract for its empty-state UI.
+Each function is read-only against D1 and returns a fully populated wire
+model (or ``None`` for the historical/per-item lookups when the entity
+doesn't exist). The "latest" and "health" builders never raise on empty
+state — they describe the warmup case explicitly, since the frontend
+depends on that contract for its empty-state UI.
 
 These builders are the only place that translates between the internal
 domain (integer cents, raw datetimes) and the wire (USD strings, ``Z``
 suffixes, ``schema_version`` envelopes).
+
+Phase 9c-iii: storage moves to async D1. The builders take a
+:class:`D1Connection` and run reads via async repository calls plus a
+small number of private helpers that issue raw ``conn.query`` (the
+helpers are publish-specific concerns — "most recent score date", "row
+count of items with the active flag set" — that don't belong in the
+public repository surface). Item-detail per-call queries (~3 per item)
+are accepted at the v1 scale; publish is once-daily.
 """
 
 from __future__ import annotations
 
-import sqlite3
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import UTC, date, datetime
+from typing import Any
 
-from dota_deals.models.domain import Signal, SignalName
+from dota_deals.models.domain import Item, Signal, SignalName
 from dota_deals.publish.models import (
     Health,
     HistoricalReport,
@@ -37,8 +45,10 @@ from dota_deals.publish.models import (
     WireWarmupEstimate,
     cents_to_usd_string,
 )
+from dota_deals.storage.d1_client import D1QueryError
 from dota_deals.storage.db import StorageError
-from dota_deals.storage.repositories import (
+from dota_deals.storage.db_async import D1Connection
+from dota_deals.storage.repositories_async import (
     daily_prices,
     get_item_by_id,
     items_missing_observation_for_date,
@@ -61,14 +71,14 @@ _ALL_SIGNAL_NAMES: tuple[SignalName, ...] = (
 # ----------------------------- public builders --------------------------------
 
 
-def build_latest_report(conn: sqlite3.Connection, *, top_n: int = 20) -> LatestReport:
+async def build_latest_report(conn: D1Connection, *, top_n: int = 20) -> LatestReport:
     """Build the wire payload for ``public/data/latest.json``.
 
     The most recent scored date's top-``top_n`` rows, ranked. If no
     scored date exists yet, returns the warmup envelope (``status="warmup"``,
     ``scores=[]``) — never raises.
     """
-    most_recent = _most_recent_score_date(conn)
+    most_recent = await _most_recent_score_date(conn)
     now = _now_utc()
 
     if most_recent is None:
@@ -83,9 +93,9 @@ def build_latest_report(conn: sqlite3.Connection, *, top_n: int = 20) -> LatestR
             scores=[],
         )
 
-    scores = _build_scores_for_date(conn, most_recent, top_n=top_n)
-    data_quality = _build_data_quality(conn, most_recent)
-    status = _resolve_status(conn, scores_exist=True, ingest_status=data_quality.ingest_status)
+    scores = await _build_scores_for_date(conn, most_recent, top_n=top_n)
+    data_quality = await _build_data_quality(conn, most_recent)
+    status = _resolve_status(scores_exist=True, ingest_status=data_quality.ingest_status)
 
     return LatestReport(
         schema_version=1,
@@ -97,18 +107,18 @@ def build_latest_report(conn: sqlite3.Connection, *, top_n: int = 20) -> LatestR
     )
 
 
-def build_historical_report(
-    conn: sqlite3.Connection, on: date, *, top_n: int = 20
+async def build_historical_report(
+    conn: D1Connection, on: date, *, top_n: int = 20
 ) -> HistoricalReport | None:
     """Build the wire payload for ``public/data/history/YYYY-MM-DD.json``.
 
     Returns ``None`` if no scores exist for ``on``; the caller decides
     what to do (the ``publish`` CLI skips writing the file in that case).
     """
-    if not _date_has_scores(conn, on):
+    if not await _date_has_scores(conn, on):
         return None
-    scores = _build_scores_for_date(conn, on, top_n=top_n)
-    data_quality = _build_data_quality(conn, on)
+    scores = await _build_scores_for_date(conn, on, top_n=top_n)
+    data_quality = await _build_data_quality(conn, on)
     return HistoricalReport(
         schema_version=1,
         generated_at=_now_utc(),
@@ -118,7 +128,7 @@ def build_historical_report(
     )
 
 
-def build_health(conn: sqlite3.Connection) -> Health:
+async def build_health(conn: D1Connection) -> Health:
     """Build the wire payload for ``public/data/health.json``.
 
     Status precedence:
@@ -131,18 +141,17 @@ def build_health(conn: sqlite3.Connection) -> Health:
     ≥ 30 calendar days (the longest signal-warmup window).
     """
     now = _now_utc()
-    coverage = _build_data_coverage(conn, now)
+    coverage = await _build_data_coverage(conn, now)
     warmup = _build_warmup_estimate(coverage)
 
-    most_recent_score_date = _most_recent_score_date(conn)
-    ingest_status_today = _ingest_status_for(conn, now.date())
+    most_recent_score_date = await _most_recent_score_date(conn)
+    ingest_status_today = await _ingest_status_for(conn, now.date())
     status = _resolve_status(
-        conn,
         scores_exist=most_recent_score_date is not None,
         ingest_status=ingest_status_today,
     )
 
-    last_run = _latest_successful_run(conn)
+    last_run = await _latest_successful_run(conn)
     return Health(
         schema_version=1,
         generated_at=now,
@@ -153,28 +162,29 @@ def build_health(conn: sqlite3.Connection) -> Health:
     )
 
 
-def build_item_detail(
-    conn: sqlite3.Connection, item_id: int, *, history_days: int = _DETAIL_HISTORY_DAYS
+async def build_item_detail(
+    conn: D1Connection, item_id: int, *, history_days: int = _DETAIL_HISTORY_DAYS
 ) -> ItemDetail | None:
     """Build the wire payload for ``public/data/items/<item_id>.json``.
 
     Returns ``None`` if ``item_id`` isn't in the ``items`` table.
     """
-    item = get_item_by_id(conn, item_id)
+    item = await get_item_by_id(conn, item_id)
     if item is None:
         return None
     now = _now_utc()
     as_of = now.date()
 
+    daily_rows = await daily_prices(conn, item_id, days=history_days, as_of=as_of)
     daily = [
-        WirePricePoint(date=d, lowest_price=cents_to_usd_string(cents))
-        for d, cents in daily_prices(conn, item_id, days=history_days, as_of=as_of)
+        WirePricePoint(date=d, lowest_price=cents_to_usd_string(cents)) for d, cents in daily_rows
     ]
+    listing_rows = await recent_listings(conn, item_id, days=history_days, as_of=as_of)
     listings = [
         WireListingPoint(observed_at=p.observed_at, listings_count=p.listings_count)
-        for p in recent_listings(conn, item_id, days=history_days, as_of=as_of)
+        for p in listing_rows
     ]
-    signals = recent_signals(conn, item_id, days=history_days, as_of=as_of)
+    signals = await recent_signals(conn, item_id, days=history_days, as_of=as_of)
     signal_series = _group_signals_into_series(signals)
 
     return ItemDetail(
@@ -199,35 +209,35 @@ def _now_utc() -> datetime:
     return datetime.now(UTC)
 
 
-def _most_recent_score_date(conn: sqlite3.Connection) -> date | None:
+async def _most_recent_score_date(conn: D1Connection) -> date | None:
     try:
-        row = conn.execute("SELECT MAX(computed_for) AS d FROM scores").fetchone()
-    except sqlite3.Error as e:
+        result = await conn.query("SELECT MAX(computed_for) AS d FROM scores")
+    except D1QueryError as e:
         raise StorageError(f"_most_recent_score_date failed: {e}") from e
-    if row is None or row["d"] is None:
+    if not result.results or result.results[0]["d"] is None:
         return None
-    return date.fromisoformat(row["d"])
+    return date.fromisoformat(str(result.results[0]["d"]))
 
 
-def _date_has_scores(conn: sqlite3.Connection, on: date) -> bool:
+async def _date_has_scores(conn: D1Connection, on: date) -> bool:
     try:
-        row = conn.execute(
-            "SELECT 1 FROM scores WHERE computed_for = ? LIMIT 1",
+        result = await conn.query(
+            "SELECT 1 AS hit FROM scores WHERE computed_for = ? LIMIT 1",
             (on.isoformat(),),
-        ).fetchone()
-    except sqlite3.Error as e:
+        )
+    except D1QueryError as e:
         raise StorageError(f"_date_has_scores failed: {e}") from e
-    return row is not None
+    return bool(result.results)
 
 
-def _build_scores_for_date(conn: sqlite3.Connection, on: date, *, top_n: int) -> list[WireScore]:
-    domain_scores = latest_scores(conn, on, top_n)
+async def _build_scores_for_date(conn: D1Connection, on: date, *, top_n: int) -> list[WireScore]:
+    domain_scores = await latest_scores(conn, on, top_n)
     if not domain_scores:
         return []
-    # One round-trip to fetch all the items we need (market_hash, name, etc.)
+    # One round-trip to fetch all the items we need.
     item_ids = tuple(s.item_id for s in domain_scores)
-    items_by_id = _items_by_id(conn, item_ids)
-    latest_prices = _latest_prices_for(conn, item_ids)
+    items_by_id = await _items_by_id(conn, item_ids)
+    latest_prices = await _latest_prices_for(conn, item_ids)
 
     wire_scores: list[WireScore] = []
     for s in domain_scores:
@@ -241,11 +251,11 @@ def _build_scores_for_date(conn: sqlite3.Connection, on: date, *, top_n: int) ->
         null_signals = list(null_signals_raw) if isinstance(null_signals_raw, list) else []
         wire_scores.append(
             WireScore(
-                item_id=item["item_id"],
-                market_hash_name=item["market_hash"],
-                name=item["name"],
-                category=item["category"],
-                hero=item["hero"],
+                item_id=item.item_id,
+                market_hash_name=item.market_hash,
+                name=item.name,
+                category=item.category,
+                hero=item.hero,
                 current_price=current_price,
                 computed_for=s.computed_for,
                 buy_score=s.score,
@@ -262,52 +272,52 @@ def _build_scores_for_date(conn: sqlite3.Connection, on: date, *, top_n: int) ->
     return wire_scores
 
 
-def _items_by_id(conn: sqlite3.Connection, item_ids: tuple[int, ...]) -> dict[int, sqlite3.Row]:
+async def _items_by_id(conn: D1Connection, item_ids: Sequence[int]) -> dict[int, Item]:
+    """Bulk fetch of a small fixed-size set of items by id (top-N for publish)."""
     if not item_ids:
         return {}
     placeholders = ",".join("?" * len(item_ids))
     try:
-        rows = conn.execute(
-            f"SELECT item_id, market_hash, name, category, hero "
+        result = await conn.query(
+            f"SELECT item_id, market_hash, name, category, hero, "
+            f"first_seen_at, last_seen_at, active, consecutive_ingest_4xx "
             f"FROM items WHERE item_id IN ({placeholders})",
-            item_ids,
-        ).fetchall()
-    except sqlite3.Error as e:
+            tuple(item_ids),
+        )
+    except D1QueryError as e:
         raise StorageError(f"_items_by_id failed: {e}") from e
-    return {int(r["item_id"]): r for r in rows}
+    return {int(row["item_id"]): _row_to_item(row) for row in result.results}
 
 
-def _latest_prices_for(conn: sqlite3.Connection, item_ids: tuple[int, ...]) -> dict[int, int]:
+async def _latest_prices_for(conn: D1Connection, item_ids: Sequence[int]) -> dict[int, int]:
     if not item_ids:
         return {}
     placeholders = ",".join("?" * len(item_ids))
     try:
-        rows = conn.execute(
+        result = await conn.query(
             f"SELECT item_id, lowest_cents FROM latest_observation "
             f"WHERE item_id IN ({placeholders})",
-            item_ids,
-        ).fetchall()
-    except sqlite3.Error as e:
+            tuple(item_ids),
+        )
+    except D1QueryError as e:
         raise StorageError(f"_latest_prices_for failed: {e}") from e
-    return {int(r["item_id"]): int(r["lowest_cents"]) for r in rows}
+    return {int(r["item_id"]): int(r["lowest_cents"]) for r in result.results}
 
 
-def _build_data_quality(conn: sqlite3.Connection, on: date) -> WireDataQuality:
-    info = latest_ingest_run_for_date(conn, on)
-    missing = items_missing_observation_for_date(conn, on)
+async def _build_data_quality(conn: D1Connection, on: date) -> WireDataQuality:
+    info = await latest_ingest_run_for_date(conn, on)
+    missing = await items_missing_observation_for_date(conn, on)
     if info is None:
         return WireDataQuality(ingest_status="missing", ingest_run_id=None, missing_items=missing)
     return WireDataQuality(ingest_status=info[1], ingest_run_id=info[0], missing_items=missing)
 
 
-def _ingest_status_for(conn: sqlite3.Connection, on: date) -> str:
-    info = latest_ingest_run_for_date(conn, on)
+async def _ingest_status_for(conn: D1Connection, on: date) -> str:
+    info = await latest_ingest_run_for_date(conn, on)
     return info[1] if info is not None else "missing"
 
 
-def _resolve_status(
-    conn: sqlite3.Connection, *, scores_exist: bool, ingest_status: str
-) -> PipelineStatus:
+def _resolve_status(*, scores_exist: bool, ingest_status: str) -> PipelineStatus:
     if not scores_exist:
         return "warmup"
     if ingest_status == "partial":
@@ -315,19 +325,18 @@ def _resolve_status(
     return "operational"
 
 
-def _build_data_coverage(conn: sqlite3.Connection, now: datetime) -> WireDataCoverage:
+async def _build_data_coverage(conn: D1Connection, now: datetime) -> WireDataCoverage:
     try:
-        items_tracked = int(
-            conn.execute("SELECT COUNT(*) FROM items WHERE active = 1").fetchone()[0]
-        )
-        items_with_signals = int(
-            conn.execute("SELECT COUNT(DISTINCT item_id) FROM signals").fetchone()[0]
-        )
-        row = conn.execute("SELECT MIN(observed_at) AS first_at FROM price_history").fetchone()
-    except sqlite3.Error as e:
+        items_tracked_r = await conn.query("SELECT COUNT(*) AS n FROM items WHERE active = 1")
+        items_tracked = int(items_tracked_r.results[0]["n"])
+        items_with_signals_r = await conn.query("SELECT COUNT(DISTINCT item_id) AS n FROM signals")
+        items_with_signals = int(items_with_signals_r.results[0]["n"])
+        first_at_r = await conn.query("SELECT MIN(observed_at) AS first_at FROM price_history")
+    except D1QueryError as e:
         raise StorageError(f"_build_data_coverage failed: {e}") from e
-    first_at_raw = row["first_at"] if row else None
-    first_at = datetime.fromisoformat(first_at_raw) if first_at_raw else None
+
+    first_at_raw = first_at_r.results[0]["first_at"] if first_at_r.results else None
+    first_at = datetime.fromisoformat(str(first_at_raw)) if first_at_raw else None
     if first_at is not None:
         days_of_history = max(0, (now.date() - first_at.date()).days + 1)
     else:
@@ -349,27 +358,44 @@ def _build_warmup_estimate(coverage: WireDataCoverage) -> WireWarmupEstimate:
     return WireWarmupEstimate(days_remaining=remaining)
 
 
-def _latest_successful_run(conn: sqlite3.Connection) -> WireRunRef | None:
+async def _latest_successful_run(conn: D1Connection) -> WireRunRef | None:
     try:
-        row = conn.execute(
+        result = await conn.query(
             """
             SELECT run_id, kind, finished_at, status
             FROM runs
             WHERE status = 'success'
             ORDER BY finished_at DESC
             LIMIT 1
-            """
-        ).fetchone()
-    except sqlite3.Error as e:
+            """,
+        )
+    except D1QueryError as e:
         raise StorageError(f"_latest_successful_run failed: {e}") from e
-    if row is None:
+    if not result.results:
         return None
-    finished_at = datetime.fromisoformat(row["finished_at"]) if row["finished_at"] else None
+    row = result.results[0]
+    finished_at_raw = row["finished_at"]
+    finished_at = datetime.fromisoformat(str(finished_at_raw)) if finished_at_raw else None
     return WireRunRef(
         run_id=str(row["run_id"]),
         kind=str(row["kind"]),
         finished_at=finished_at,
         status=str(row["status"]),
+    )
+
+
+def _row_to_item(row: dict[str, Any]) -> Item:
+    last_seen = row["last_seen_at"]
+    return Item(
+        item_id=int(row["item_id"]),
+        market_hash=str(row["market_hash"]),
+        name=str(row["name"]),
+        category=row["category"],
+        hero=row["hero"],
+        first_seen_at=datetime.fromisoformat(str(row["first_seen_at"])),
+        last_seen_at=datetime.fromisoformat(str(last_seen)) if last_seen else None,
+        active=bool(row["active"]),
+        consecutive_ingest_4xx=int(row["consecutive_ingest_4xx"]),
     )
 
 

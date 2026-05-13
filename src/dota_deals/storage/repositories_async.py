@@ -52,11 +52,16 @@ from dota_deals.storage.d1_client import D1QueryError, D1Statement
 from dota_deals.storage.db import IntegrityViolation, StorageError
 from dota_deals.storage.db_async import D1Connection
 
-# D1's default per-statement bound-parameter limit is 999. Chunking the
-# IN clause at 100 leaves comfortable headroom for the two extra params
-# (date window bounds) and keeps each query well under any future
-# tightening.
-_BULK_QUERY_CHUNK_SIZE = 100
+# D1's per-statement bound-parameter limit is 100 (documented at
+# https://developers.cloudflare.com/d1/platform/limits/, much tighter
+# than the upstream SQLite default of 999). Phase 9c-iii's real-D1
+# universe smoke test surfaced this — with 1,424 items in the table,
+# the next bulk read of signals_for_items_on_date used
+# 100 IN placeholders + 1 date param = 101 bound vars and got
+# "too many SQL variables at offset 314: SQLITE_ERROR". 90 leaves
+# headroom for up to 10 non-IN params per query without me having
+# to reason about the budget per call site.
+_BULK_QUERY_CHUNK_SIZE = 90
 
 _ITEM_COLUMNS = (
     "item_id, market_hash, name, category, hero, "
@@ -200,6 +205,56 @@ async def upsert_item(conn: D1Connection, item: Item) -> int:
     if not result.results:
         raise StorageError(f"upsert_item: item_id lookup failed for {item.market_hash!r}")
     return int(result.results[0]["item_id"])
+
+
+async def upsert_items_batch(conn: D1Connection, items: Sequence[Item]) -> int:
+    """Batch variant of :func:`upsert_item` for the universe-refresh hot path.
+
+    Universe currently sights ~500-800 items per refresh; per-item HTTP
+    round-trips would push a single refresh into 30+ seconds. Batched
+    upserts amortize the HTTP cost over D1's transactional batch
+    endpoint.
+
+    The ON CONFLICT clause is identical to :func:`upsert_item`:
+    overwrite name/category/hero/last_seen_at, force ``active=1``, reset
+    the strike counter. Returns total rows changed (across both insert
+    and update paths); the universe runner uses this for telemetry
+    only, not for resolving ids — callers that need ids back follow up
+    with :func:`get_item_by_hash`.
+    """
+    if not items:
+        return 0
+    statements = [
+        D1Statement(
+            sql=(
+                "INSERT INTO items "
+                "(market_hash, name, category, hero, "
+                "first_seen_at, last_seen_at, active, consecutive_ingest_4xx) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1, 0) "
+                "ON CONFLICT(market_hash) DO UPDATE SET "
+                "name = excluded.name, "
+                "category = excluded.category, "
+                "hero = excluded.hero, "
+                "last_seen_at = excluded.last_seen_at, "
+                "active = 1, "
+                "consecutive_ingest_4xx = 0"
+            ),
+            params=(
+                i.market_hash,
+                i.name,
+                i.category,
+                i.hero,
+                i.first_seen_at.isoformat(),
+                i.last_seen_at.isoformat() if i.last_seen_at else None,
+            ),
+        )
+        for i in items
+    ]
+    try:
+        results = await conn.batch(statements)
+    except D1QueryError as exc:
+        raise _translate_integrity(exc, context="upsert_items_batch failed") from exc
+    return sum(r.meta.changes for r in results)
 
 
 async def get_item_by_hash(conn: D1Connection, market_hash: str) -> Item | None:
@@ -868,6 +923,41 @@ async def signals_for(conn: D1Connection, item_id: int, on: date) -> list[Signal
             exc, context=f"signals_for failed for item_id={item_id}, on={on.isoformat()}"
         ) from exc
     return [_row_to_signal(row) for row in result.results]
+
+
+async def signals_for_items_on_date(
+    conn: D1Connection,
+    item_ids: Sequence[int],
+    on: date,
+) -> dict[int, list[Signal]]:
+    """Bulk variant of :func:`signals_for` for the scoring runner.
+
+    Returns a dict keyed by ``item_id`` with the per-item signal list
+    (sorted by ``signal_name`` for stable display). Items in ``item_ids``
+    with no signals on ``on`` map to ``[]``, matching the empty-list
+    contract the other bulk reads use. Chunks the IN clause at
+    :data:`_BULK_QUERY_CHUNK_SIZE` so a full universe doesn't blow past
+    D1's per-statement parameter limit.
+    """
+    if not item_ids:
+        return {}
+    out: dict[int, list[Signal]] = {iid: [] for iid in item_ids}
+    for chunk in _chunked(list(item_ids), _BULK_QUERY_CHUNK_SIZE):
+        placeholders = ",".join("?" * len(chunk))
+        sql = (
+            "SELECT item_id, computed_for, signal_name, value, metadata_json "
+            "FROM signals "
+            f"WHERE computed_for = ? AND item_id IN ({placeholders}) "
+            "ORDER BY item_id, signal_name"
+        )
+        params = (on.isoformat(), *chunk)
+        try:
+            result = await conn.query(sql, params)
+        except D1QueryError as exc:
+            raise _translate_storage(exc, context="signals_for_items_on_date failed") from exc
+        for row in result.results:
+            out.setdefault(int(row["item_id"]), []).append(_row_to_signal(row))
+    return out
 
 
 async def recent_signals(

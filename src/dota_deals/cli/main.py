@@ -22,7 +22,7 @@ import sys
 import uuid
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 
@@ -43,6 +43,7 @@ from dota_deals.publish.writer import write_atomic
 from dota_deals.scoring.runner import compute_scores_for
 from dota_deals.signals.runner import compute_signals_for
 from dota_deals.storage.db import connect
+from dota_deals.storage.db_async import connect as connect_async
 from dota_deals.storage.repositories import (
     active_items,
     items_missing_observation_for_date,
@@ -287,8 +288,10 @@ def score_command(
 
     run_id = str(uuid.uuid4())
     log.info("starting scoring", as_of=as_of.isoformat())
-    summary: RunSummary = compute_scores_for(
-        as_of=as_of, settings=settings, run_id=run_id, parent_run_id=parent_run_id
+    summary: RunSummary = asyncio.run(
+        compute_scores_for(
+            as_of=as_of, settings=settings, run_id=run_id, parent_run_id=parent_run_id
+        )
     )
     log.info(
         "scoring complete",
@@ -383,18 +386,35 @@ def publish_command(
         source="cli", parent_run_id=parent_run_id, out_dir=str(out_dir)
     )
 
-    conn = connect(settings.db_path)
-    try:
-        latest = build_latest_report(conn, top_n=top)
+    asyncio.run(_publish_async(settings, top, out_dir, include_items, log))
+
+
+async def _publish_async(
+    settings: Settings,
+    top: int,
+    out_dir: Path,
+    include_items: bool,
+    log: Any,
+) -> None:
+    """Async body of ``dota-deals publish``.
+
+    Lives separately so the typer-registered command stays sync and we
+    pay one ``asyncio.run`` per CLI invocation rather than one per
+    builder call. All four builders share the same D1Connection, so
+    the rows-read accumulator surfaces the publish run's total in a
+    single budget-summary line.
+    """
+    async with connect_async(settings) as conn:
+        latest = await build_latest_report(conn, top_n=top)
         write_atomic(latest, out_dir / "latest.json")
         log.info("published latest.json", status=latest.status, score_count=len(latest.scores))
 
-        health = build_health(conn)
+        health = await build_health(conn)
         write_atomic(health, out_dir / "health.json")
         log.info("published health.json", status=health.status)
 
         today = datetime.now(UTC).date()
-        historical = build_historical_report(conn, today, top_n=top)
+        historical = await build_historical_report(conn, today, top_n=top)
         if historical is not None:
             write_atomic(historical, out_dir / "history" / f"{today.isoformat()}.json")
             log.info("published history file", date=today.isoformat())
@@ -404,14 +424,12 @@ def publish_command(
         if include_items:
             written = 0
             for score in latest.scores:
-                detail = build_item_detail(conn, score.item_id)
+                detail = await build_item_detail(conn, score.item_id)
                 if detail is None:
                     continue
                 write_atomic(detail, out_dir / "items" / f"{score.item_id}.json")
                 written += 1
             log.info("published item detail files", count=written)
-    finally:
-        conn.close()
 
 
 @db_app.command("pull")

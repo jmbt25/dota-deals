@@ -1,31 +1,48 @@
-"""Smoke test for ``dota-deals publish``.
+"""Smoke test for the publish CLI body.
 
-End-to-end: populate a DB with one scored item, invoke the CLI's
-publish command through Typer's testing helper, assert the expected
-JSON files exist and parse.
+End-to-end: populate a fake-backed D1 with one scored item, invoke the
+publish helper directly (rather than via typer's CliRunner — the
+runner can't host an ``asyncio.run`` inside an existing event loop),
+assert the expected JSON files exist and parse.
+
+Phase 9c-iii: the CLI command runs ``asyncio.run(_publish_async(...))``
+internally. ``CliRunner`` would call into the typer-wrapped sync entry,
+which would then re-call ``asyncio.run`` — incompatible with the test's
+event loop. Calling ``_publish_async`` directly keeps the meaningful
+coverage (the four-builder orchestration with shared D1Connection)
+without fighting the runner. The typer-parsed defaults are trivial.
 """
 
 from __future__ import annotations
 
 import json
-import sqlite3
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, time
 from pathlib import Path
+from typing import Any
 
 import pytest
-from typer.testing import CliRunner
 
-from dota_deals.cli.main import app
-from tests.conftest import insert_test_item
+import dota_deals.cli.main as cli_main
+from dota_deals.cli.main import _publish_async
+from dota_deals.config import Settings
+from dota_deals.storage.db_async import D1Connection
+from tests._d1_fake import D1FakeClient
+from tests.conftest import insert_test_item_async
 
 AS_OF = date(2026, 5, 13)
 
 
-def test_publish_writes_latest_and_health(
-    tmp_path: Path, db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.asyncio
+async def test_publish_writes_latest_and_health(
+    tmp_path: Path,
+    db_conn_async: tuple[D1Connection, D1FakeClient],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    item_id = insert_test_item(db_conn, market_hash="X", category="arcana")
-    db_conn.execute(
+    conn, fake = db_conn_async
+    item_id = await insert_test_item_async(conn, market_hash="X", category="arcana")
+    await conn.execute(
         """
         INSERT INTO scores (item_id, computed_for, buy_score, components_json,
                             explanation, data_quality_json)
@@ -48,7 +65,7 @@ def test_publish_writes_latest_and_health(
             json.dumps({"null_signals": ["event_proximity"]}),
         ),
     )
-    db_conn.execute(
+    await conn.execute(
         """
         INSERT INTO latest_observation
             (item_id, observed_at, lowest_cents, listings_count)
@@ -61,15 +78,36 @@ def test_publish_writes_latest_and_health(
             42,
         ),
     )
-    db_conn.commit()
-    # Point load_settings at the test DB path via env.
-    db_path = db_conn.execute("PRAGMA database_list").fetchone()["file"]
-    monkeypatch.setenv("DB_PATH", db_path)
+
+    # Patch connect_async so the publish helper opens a fresh
+    # D1Connection wrapping the *same* fake the fixture is using;
+    # both connections see the same in-memory store.
+    @asynccontextmanager
+    async def fake_connect(
+        settings: Settings, *, backend: object = None
+    ) -> AsyncIterator[D1Connection]:
+        cli_conn = D1Connection(fake, budget_warn=settings.d1_daily_budget_warn)
+        try:
+            yield cli_conn
+        finally:
+            cli_conn.log_budget_summary()
+
+    monkeypatch.setattr(cli_main, "connect_async", fake_connect)
+
+    settings = Settings(
+        _env_file=None,
+        db_path=tmp_path / "x.db",
+        cloudflare_account_id="test",
+        cloudflare_d1_database_id="test",
+        cloudflare_d1_api_token="test",
+    )
+
     out_dir = tmp_path / "out"
 
-    runner = CliRunner()
-    result = runner.invoke(app, ["publish", "--top", "5", "--out-dir", str(out_dir)])
-    assert result.exit_code == 0, result.output
+    class _NoopLog:
+        def info(self, *_args: Any, **_kwargs: Any) -> None: ...
+
+    await _publish_async(settings, top=5, out_dir=out_dir, include_items=False, log=_NoopLog())
 
     latest = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
     assert latest["schema_version"] == 1
