@@ -46,9 +46,8 @@ from dota_deals.publish.models import (
     cents_to_usd_string,
 )
 from dota_deals.storage.d1_client import D1QueryError
-from dota_deals.storage.db import StorageError
-from dota_deals.storage.db_async import D1Connection
-from dota_deals.storage.repositories_async import (
+from dota_deals.storage.db import D1Connection, StorageError
+from dota_deals.storage.repositories import (
     daily_prices,
     get_item_by_id,
     items_missing_observation_for_date,

@@ -36,9 +36,8 @@ from dota_deals.signals import (
     supply_velocity,
 )
 from dota_deals.signals.dataset import DataLookup, build_data_lookup
-from dota_deals.storage.db import StorageError
-from dota_deals.storage.db_async import D1Backend, connect
-from dota_deals.storage.repositories_async import (
+from dota_deals.storage.db import D1Backend, StorageError, connect
+from dota_deals.storage.repositories import (
     insert_run,
     insert_signals,
     update_run,

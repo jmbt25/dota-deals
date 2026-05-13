@@ -7,8 +7,8 @@ validates each response, persists valid records to ``price_history`` /
 
 Phase 9c-i note: storage was moved from local SQLite to Cloudflare D1
 over HTTP. The runner now opens a :class:`D1Connection` via
-:func:`dota_deals.storage.db_async.connect` and dispatches to
-:mod:`dota_deals.storage.repositories_async`. The Steam-side concurrency
+:func:`dota_deals.storage.db.connect` and dispatches to
+:mod:`dota_deals.storage.repositories`. The Steam-side concurrency
 model and slot-truncation semantics are unchanged from Phase 3.
 
 Observed-at semantics
@@ -37,8 +37,8 @@ from dota_deals.ingest.steam import (
 )
 from dota_deals.logging import get_logger
 from dota_deals.models.domain import ListingPoint, PricePoint, RunStatus, RunSummary
-from dota_deals.storage.db_async import D1Backend, D1Connection, connect
-from dota_deals.storage.repositories_async import (
+from dota_deals.storage.db import D1Backend, D1Connection, connect
+from dota_deals.storage.repositories import (
     get_item_by_hash,
     increment_ingest_strikes,
     insert_listing_point,

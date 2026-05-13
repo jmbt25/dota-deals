@@ -1,77 +1,44 @@
-# D1 migration
+# D1 storage layer
 
-We're moving dota-deals' storage backend from local SQLite (synced to R2
-between GHA runs) to Cloudflare D1, accessed over the public REST API.
-The pipeline stays a Python process on GitHub Actions; only the storage
-layer changes. The frontend keeps reading the same JSON files in
-`public/data/` for now — a TypeScript Worker that serves directly from
-D1 lands in a later phase.
+dota-deals' storage is Cloudflare D1, accessed over the public REST API.
+The pipeline runs as a Python process on GitHub Actions and talks to D1
+via async HTTP. The frontend reads JSON files committed to
+`public/data/`; a future TypeScript Worker that serves directly from D1
+is sketched but not built.
+
+This doc is the operational reference. The migration that produced it
+(local SQLite synced to R2 → D1) is complete as of Phase 9c-iv —
+that history is in the git log, not here.
 
 ## Why D1
 
-Three constraints push us off the R2-synced SQLite:
+Three constraints pushed us off R2-synced SQLite:
 
 1. **Concurrency.** With R2 sync, only one run can hold the database at
-   a time. As we add ad-hoc tools (backfill scripts, one-off queries
-   from a Worker, the eventual REST API), a single-writer pattern stops
-   scaling.
-2. **Frontend story.** The post-MVP plan serves item detail pages from
-   a Worker that queries the database directly. That Worker can read
-   D1 in milliseconds; reading R2-SQLite would mean re-downloading the
-   whole file per request.
+   a time. Ad-hoc tools (backfill scripts, one-off queries from a
+   Worker, the eventual REST API) don't compose with a single-writer
+   pattern.
+2. **Frontend story.** The post-MVP plan serves item-detail pages from
+   a Worker that queries the database directly. A Worker can read D1 in
+   milliseconds; reading R2-SQLite would mean re-downloading the whole
+   file per request.
 3. **Operational surface.** D1 gives us `wrangler d1 execute` /
    `wrangler d1 migrations`, web-UI query inspection, and per-query
    metrics for free. The R2-SQLite story required hand-rolled push/pull
-   plus a stuck-lock recovery story we never quite finished.
-
-## Phasing
-
-This migration is split into discrete commits to keep the test suite
-green at every step:
-
-| Phase | Scope | Status |
-|---|---|---|
-| 9a | D1 client (HTTP boundary), settings, schema migration, client tests | **this commit** |
-| 9b | Repository layer rewrite (async, batch-aware) + DataLookup pre-fetch + runner refactor + test conversion | next |
-| 10 | GHA workflow: drop R2 sync, point at D1 | follows 9b |
-| 11 | TypeScript Worker that queries D1 directly | post-10 |
-| 12 | Frontend talks to Worker; static JSON files retire | post-11 |
-| 13 | Delete R2 client, `publish/` module, and committed `public/data/` | last |
-
-What this commit (9a) lands:
-
-- `src/dota_deals/storage/d1_client.py` — async HTTP client with the
-  typed exception hierarchy below, response-envelope Pydantic models,
-  client-side batch chunking, hand-rolled retries with jittered
-  backoff for transient/5xx errors and ``Retry-After``-honoring 429
-  handling.
-- `migrations/0001_initial.sql` — full schema, idempotent (`IF NOT
-  EXISTS` everywhere). One divergence from local SQLite: the
-  `v_daily_price` view is gone (see "Median moves to Python" below).
-- `tests/test_storage_d1_client.py` — respx-mocked HTTP tests.
-- Five new `Settings` fields documented in `.env.example`.
-
-What 9a does **not** touch:
-
-- The current `storage.db` / `storage.repositories` / `storage.schema.sql`
-  files. They remain the active code path for every test in the suite
-  until 9b cuts over.
-- Any runner, the CLI, the publish layer, the frontend.
+   plus a stuck-lock recovery story that never quite landed.
 
 ## Setup
 
-`wrangler` resolves a D1 database name (`dota-deals`) to its UUID via a
-`wrangler.toml` at the repo root — checked in alongside this doc.
-Without that file, `wrangler d1 migrations apply` fails with "No
-configuration file found." The committed `wrangler.toml` only declares
-the D1 binding for now; the Worker `name` / `main` fields start
-mattering in Phase 11.
+`wrangler` resolves the human-readable database name (`dota-deals`) to
+its UUID via the checked-in `wrangler.toml` at the repo root. Without
+that file, `wrangler d1 migrations apply` fails with "No configuration
+file found."
 
-One-time, before phase 9b:
+One-time:
 
 ```bash
-# Already done — DB exists at id cbd9fdf6-127b-4295-aeb9-5c1ea9aca9a7,
-# region ENAM. Captured here for reproducibility.
+# DB already exists at id cbd9fdf6-127b-4295-aeb9-5c1ea9aca9a7,
+# region ENAM. Captured for reproducibility.
 wrangler d1 create dota-deals
 
 # Apply the schema. Idempotent — safe to rerun.
@@ -90,7 +57,7 @@ wrangler d1 execute dota-deals --local \
     --command "SELECT count(*) FROM items;"
 ```
 
-Set these in `.env` (and as GitHub Actions secrets later, in phase 10):
+Set these in `.env` (and as GitHub Actions secrets in Phase 10):
 
 ```
 CLOUDFLARE_ACCOUNT_ID=<account id>
@@ -100,6 +67,39 @@ CLOUDFLARE_D1_API_TOKEN=<token with "D1: Edit" on this database>
 
 The token only needs `D1: Edit` on the one database; do not reuse a
 broader-scoped token here.
+
+## Architecture
+
+- **`storage/d1_client.py`** — HTTP boundary. Async client over the
+  Cloudflare REST API with the typed exception hierarchy below,
+  response-envelope Pydantic models, client-side batch chunking,
+  hand-rolled retries with jittered backoff for transient/5xx errors,
+  and `Retry-After`-honoring 429 handling. Tests in
+  `tests/test_storage_d1_client.py` use respx to pin wire shape.
+- **`storage/db.py`** — application-level `D1Connection` wrapper that
+  accumulates `rows_read` / `rows_written` across the lifetime of a
+  connection and logs a WARNING at close when totals exceed
+  `Settings.d1_daily_budget_warn`. Also exports `connect()` as an
+  `@asynccontextmanager` and the storage exception hierarchy
+  (`StorageError`, `IntegrityViolation`, `SchemaError`).
+- **`storage/repositories.py`** — typed async repository functions.
+  Per-row writes for one-shots; batch writes (`insert_price_points`,
+  `insert_signals`, etc.) for hot paths; bulk reads
+  (`daily_prices_for_items`, `signals_for_items_on_date`) for the
+  signal-runner's fetch-once / dispatch-many pattern.
+- **`migrations/0001_initial.sql`** — the schema. Applied by
+  `wrangler d1 migrations apply` to remote D1 and by
+  `tests/_d1_fake.py::D1FakeClient` to the in-memory SQLite test
+  fake. Every CREATE is `IF NOT EXISTS`, every migration is
+  idempotent.
+
+`tests/_d1_fake.py` is the in-memory drop-in for `D1Client`. Its
+`__aenter__` opens a fresh `sqlite3.Connection(":memory:")` with
+`isolation_level=None` (autocommit; the explicit `BEGIN`/`COMMIT` in
+`batch()` matches D1's documented batch atomicity), then applies
+every `[0-9]*.sql` file in `migrations/` in lex order — so the fake's
+schema can't drift from production's. Repository tests run against the
+fake; the D1 client itself is tested with respx HTTP mocks.
 
 ## Error model
 
@@ -115,22 +115,21 @@ branch by disposition rather than parsing strings.
 | `D1QueryError` | D1 ran the request but `success=False`, or returned a 4xx other than 429. Carries the failing SQL + params. | Surface to logs; classify by code (e.g., 7500 = UNIQUE constraint). Constraint violations on idempotent inserts shouldn't reach this path — use `INSERT OR IGNORE`. |
 | `D1TransportError` | Network error or 5xx after retries exhausted. | Caller decides: abort the run, retry after a longer pause, or surface as `partial`. |
 
-All inherit from `D1Error` so a catch-all is still possible at the CLI
-top level, but the typed hierarchy is the supported interface.
+The repository layer translates these onto the sync-compatible
+`StorageError` / `IntegrityViolation` hierarchy at the boundary so
+caller code (runners, builders) stays storage-agnostic.
 
 ## Median moves to Python
 
 The local SQLite schema had a `v_daily_price` view backed by a
 user-registered `MEDIAN` aggregate. D1 doesn't expose
-`create_aggregate` (or any other Python escape hatch), so we move the
-per-day median into Python.
+`create_aggregate` (or any other Python escape hatch), so per-day
+median lives in Python:
 
-Concretely, in 9b:
-
-- `daily_prices(item_id, days, as_of)` becomes a thin wrapper that
-  fetches raw `price_history` rows, groups by `date(observed_at)` in
-  Python, and computes the integer-floor median per group.
-- The signal-runner pre-fetches all items' price history once per
+- `daily_prices(item_id, days, as_of)` fetches raw `price_history`
+  rows, groups by `date(observed_at)` in Python, and computes the
+  integer-floor median per group.
+- The signal runner pre-fetches all items' price history once per
   invocation into a `DataLookup`, so the median runs once per
   (item, date), not once per signal.
 
@@ -141,17 +140,28 @@ budget.
 
 ## Operational notes
 
-- **Batch size.** `D1_MAX_BATCH_SIZE=100` is conservative; D1 tolerates
-  larger batches but documents 100 as the practical ceiling. The
-  client splits any batch above this transparently and stitches
-  results in order.
+- **Batch size.** `D1_MAX_BATCH_SIZE=100` is conservative; D1 documents
+  100 as the practical batch ceiling. The client splits any batch
+  above this transparently and stitches results in order.
+- **Variable limit.** D1 enforces a per-statement bound-parameter
+  cap of 100 (much tighter than the upstream SQLite default of 999).
+  Bulk reads chunk their IN clauses at `_BULK_QUERY_CHUNK_SIZE = 90`
+  to leave headroom for up to 10 non-IN params. This was a real-D1
+  surprise caught in Phase 9c-iii — the previous chunk size of 100
+  worked against the test fake (which inherits SQLite's loose
+  default) but tripped "too many SQL variables" on real D1 the
+  moment the universe filled past 100 items.
 - **Sequential sub-batches.** When a `batch()` call exceeds the size
-  limit, sub-batches are issued sequentially, not in parallel. Each
-  sub-batch is its own D1 transaction; parallelizing would break the
-  illusion of one logical write being all-or-nothing for the caller
-  (it would already be that way at sub-batch granularity, but the
-  failure mode would be subtler).
-- **Retries.** Three attempts for network/timeout/5xx, with full
+  limit, sub-batches are issued sequentially. Each sub-batch is its
+  own D1 transaction; parallelizing would lose the all-or-nothing
+  semantics each transaction promises locally.
+- **Wire shape for batches.** D1's `/query` endpoint accepts either
+  `{"sql": ..., "params": ...}` for a single statement or
+  `{"batch": [...]}` for multi-statement transactions. A bare top-
+  level array returns HTTP 400 with code 7400 "Invalid input:
+  Expected object, received array." Pinned by the
+  `test_batch_sends_all_statements_in_one_request` test.
+- **Retries.** Three attempts for network/timeout/5xx with full
   jitter on exponential backoff (1s → 2s → 4s, capped at 30s).
   Sleep is injectable for tests.
 - **Rate-limit handling.** 429 honors `Retry-After` when present;
@@ -172,9 +182,31 @@ When something looks wrong in a scheduled run:
   attribute and run it with `wrangler d1 execute --local`.
 - `EXPLAIN QUERY PLAN` works inside `wrangler d1 execute` and is the
   fastest way to confirm an index is being used.
+- The `D1Connection`'s budget summary line at process exit logs
+  cumulative rows-read/rows-written. WARNING fires when reads exceed
+  `D1_DAILY_BUDGET_WARN` (default 1M); set to 0 in `.env` to silence
+  during a deliberate full-table scan.
 
-## What's left
+## Lessons the smoke tests taught us
 
-After 9b lands, this doc gets an "Operational pitfalls" section
-populated by real incidents. The pitfalls are easier to write down
-once we've stubbed our toes on them than predict ahead of time.
+Each phase of the migration produced a real-D1 bug that no mocked
+test could catch. Each is now pinned by a regression test so the
+lesson can't be unlearned:
+
+1. **Phase 9a `/render` deprecation.** Steam migrated the Community
+   frontend to React SSR; the legacy `/market/listings/<appid>/<name>/render`
+   URL returns ~600KB HTML rather than JSON regardless of headers.
+   Fix: `fetch_listings` now hits `/market/search/render?norender=1`
+   with exact `hash_name` filtering. Test: `test_runner_listings_html_response_quarantines`.
+2. **Phase 9c-ii batch wire shape.** D1's `/query` endpoint rejects a
+   bare-array body with code 7400. The fix wraps batches as
+   `{"batch": [...]}`. Test: `test_batch_sends_all_statements_in_one_request`
+   pins the wrapping object.
+3. **Phase 9c-iii variable limit.** D1 enforces 100 bound parameters
+   per statement, not the SQLite default of 999. Bulk reads chunk at
+   90 to leave headroom; the variable-limit comment in
+   `repositories.py` keeps the lesson in code.
+
+The pattern: every cutover phase produces at least one
+reality-only bug. The smoke-test discipline is what catches them
+before they reach a scheduled run.

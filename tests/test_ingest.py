@@ -39,9 +39,9 @@ from dota_deals.ingest.steam import (
     IngestValidationError,
     SteamMarketClient,
 )
-from dota_deals.storage.db_async import D1Connection
+from dota_deals.storage.db import D1Connection
 from tests._d1_fake import D1FakeClient
-from tests.conftest import insert_test_item_async
+from tests.conftest import insert_test_item
 
 PRICE_OVERVIEW = "https://steamcommunity.com/market/priceoverview/"
 # Listings are sourced from market/search/render?norender=1 (after the
@@ -274,11 +274,11 @@ async def test_client_5xx_retried(settings: Settings) -> None:
 @pytest.mark.asyncio
 async def test_runner_happy_path(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 1: happy path persists rows in price_history + listing_history."""
-    conn, fake = db_conn_async
-    item_id = await insert_test_item_async(
+    conn, fake = db_conn
+    item_id = await insert_test_item(
         conn, market_hash="Inscribed Manifold Paradox", hero="Phantom Assassin"
     )
 
@@ -325,12 +325,12 @@ async def test_runner_happy_path(
 @pytest.mark.asyncio
 async def test_runner_4xx_run_continues(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 4 (runner level): a 4xx on one item doesn't abort the run."""
-    conn, fake = db_conn_async
-    await insert_test_item_async(conn, market_hash="GOOD")
-    await insert_test_item_async(conn, market_hash="BAD")
+    conn, fake = db_conn
+    await insert_test_item(conn, market_hash="GOOD")
+    await insert_test_item(conn, market_hash="BAD")
 
     def route_overview(request: httpx.Request) -> httpx.Response:
         name = request.url.params.get("market_hash_name", "")
@@ -360,11 +360,11 @@ async def test_runner_4xx_run_continues(
 @pytest.mark.asyncio
 async def test_runner_validation_routes_to_quarantine(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 5: bad payload lands in quarantine, not price_history."""
-    conn, fake = db_conn_async
-    await insert_test_item_async(conn, market_hash="X")
+    conn, fake = db_conn
+    await insert_test_item(conn, market_hash="X")
 
     bad = {
         "success": True,
@@ -400,11 +400,11 @@ async def test_runner_validation_routes_to_quarantine(
 @pytest.mark.asyncio
 async def test_runner_idempotent_double_run(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 6: two runs at the same polling slot produce one row each."""
-    conn, fake = db_conn_async
-    await insert_test_item_async(conn, market_hash="X")
+    conn, fake = db_conn
+    await insert_test_item(conn, market_hash="X")
 
     with respx.mock(assert_all_called=False) as router:
         router.get(PRICE_OVERVIEW).mock(return_value=_ok_priceoverview())
@@ -436,12 +436,12 @@ async def test_runner_idempotent_double_run(
 @pytest.mark.asyncio
 async def test_runner_summary_reflects_mixed_outcomes(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 7: runs table records ok / quarantined / failed counts faithfully."""
-    conn, fake = db_conn_async
-    await insert_test_item_async(conn, market_hash="OK_ITEM")
-    await insert_test_item_async(conn, market_hash="BAD_ITEM")
+    conn, fake = db_conn
+    await insert_test_item(conn, market_hash="OK_ITEM")
+    await insert_test_item(conn, market_hash="BAD_ITEM")
     # UNKNOWN_ITEM intentionally not in the items table.
 
     def route_overview(request: httpx.Request) -> httpx.Response:
@@ -483,11 +483,11 @@ async def test_runner_summary_reflects_mixed_outcomes(
 @pytest.mark.asyncio
 async def test_deactivation_fires_at_exactly_three_strikes(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Phase 4a: 3 consecutive 4xx flips items.active = 0. Not at 2, not at 4."""
-    conn, fake = db_conn_async
-    await insert_test_item_async(conn, market_hash="X")
+    conn, fake = db_conn
+    await insert_test_item(conn, market_hash="X")
 
     async def _state() -> tuple[int, int]:
         rows = await _select(
@@ -528,11 +528,11 @@ async def test_deactivation_fires_at_exactly_three_strikes(
 @pytest.mark.asyncio
 async def test_strike_counter_reset_on_success(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """A successful ingest run clears any accumulated strikes."""
-    conn, fake = db_conn_async
-    await insert_test_item_async(conn, market_hash="X")
+    conn, fake = db_conn
+    await insert_test_item(conn, market_hash="X")
     # Pre-seed two strikes so a third would deactivate.
     await conn.execute(
         "UPDATE items SET consecutive_ingest_4xx = 2 WHERE market_hash = ?",
@@ -558,7 +558,7 @@ async def test_strike_counter_reset_on_success(
 
 @pytest.mark.asyncio
 async def test_non_4xx_failures_do_not_count_as_strikes(
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Only true 4xx (not 429, not 5xx, not timeouts) increment the strike counter.
 
@@ -569,8 +569,8 @@ async def test_non_4xx_failures_do_not_count_as_strikes(
     """
     from dota_deals.logging import get_logger
 
-    conn, _fake = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X")
+    conn, _fake = db_conn
+    item_id = await insert_test_item(conn, market_hash="X")
     log = get_logger("test").bind()
 
     for status_code in (429, None, 503, 500, 502):
@@ -599,7 +599,7 @@ async def test_non_4xx_failures_do_not_count_as_strikes(
 @pytest.mark.asyncio
 async def test_runner_listings_html_response_quarantines(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Phase 9c-i regression. Steam's React-SSR migration in mid-2026
     started serving the legacy ``/market/listings/<appid>/<name>/render``
@@ -612,8 +612,8 @@ async def test_runner_listings_html_response_quarantines(
     HTML at the search endpoint and asserting the payload is
     preserved.
     """
-    conn, fake = db_conn_async
-    await insert_test_item_async(conn, market_hash="Manifold Paradox")
+    conn, fake = db_conn
+    await insert_test_item(conn, market_hash="Manifold Paradox")
 
     html_body = (
         '<!DOCTYPE html><html lang="en" class="responsive DesktopUI">'
@@ -650,7 +650,7 @@ async def test_runner_listings_html_response_quarantines(
 @pytest.mark.asyncio
 async def test_runner_listings_no_exact_match_fails_without_quarantine(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """When ``search/render`` returns valid JSON but no result's
     ``hash_name`` matches the requested item exactly (Steam's search is
@@ -660,8 +660,8 @@ async def test_runner_listings_no_exact_match_fails_without_quarantine(
     without accruing a 4xx strike (status_code is None, so the strike
     counter rule doesn't apply).
     """
-    conn, fake = db_conn_async
-    await insert_test_item_async(conn, market_hash="Manifold Paradox")
+    conn, fake = db_conn
+    await insert_test_item(conn, market_hash="Manifold Paradox")
 
     def respond(request: httpx.Request) -> httpx.Response:
         # Plausible but unhelpful response — search returns siblings, not

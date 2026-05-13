@@ -4,7 +4,7 @@ The warmup / empty-state contracts get explicit assertions — the frontend
 depends on them for its empty-state UI. If those break silently the bug
 shows up only when a user lands on the page during cold start.
 
-Phase 9c-iii: builders are async over D1. Tests use ``db_conn_async``
+Phase 9c-iii: builders are async over D1. Tests use ``db_conn``
 and ``await`` every builder call.
 """
 
@@ -22,9 +22,9 @@ from dota_deals.publish.builder import (
     build_latest_report,
 )
 from dota_deals.publish.models import LatestReport
-from dota_deals.storage.db_async import D1Connection
+from dota_deals.storage.db import D1Connection
 from tests._d1_fake import D1FakeClient
-from tests.conftest import insert_test_item_async
+from tests.conftest import insert_test_item
 
 AS_OF = date(2026, 5, 13)
 
@@ -124,13 +124,13 @@ async def _insert_price_history(
 
 @pytest.mark.asyncio
 async def test_latest_report_warmup_when_no_scores(
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Empty DB → warmup envelope. The frontend depends on this contract.
 
     Status MUST be 'warmup', scores MUST be empty, report_date MUST be None.
     """
-    conn, _ = db_conn_async
+    conn, _ = db_conn
     report = await build_latest_report(conn)
     assert isinstance(report, LatestReport)
     assert report.status == "warmup"
@@ -141,10 +141,10 @@ async def test_latest_report_warmup_when_no_scores(
 
 @pytest.mark.asyncio
 async def test_latest_report_happy_path(
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
-    conn, _ = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X", category="arcana")
+    conn, _ = db_conn
+    item_id = await insert_test_item(conn, market_hash="X", category="arcana")
     await _insert_score(conn, item_id=item_id, score=0.62)
     await _insert_latest_observation(conn, item_id, lowest_cents=3450)
     await _insert_ingest_run(conn, run_id="ingest-1", status="success")
@@ -164,10 +164,10 @@ async def test_latest_report_happy_path(
 
 @pytest.mark.asyncio
 async def test_latest_report_degraded_when_ingest_partial(
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
-    conn, _ = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X", category="arcana")
+    conn, _ = db_conn
+    item_id = await insert_test_item(conn, market_hash="X", category="arcana")
     await _insert_score(conn, item_id=item_id, score=0.5)
     await _insert_ingest_run(conn, run_id="ingest-partial", status="partial")
 
@@ -177,12 +177,12 @@ async def test_latest_report_degraded_when_ingest_partial(
 
 @pytest.mark.asyncio
 async def test_latest_report_top_n_truncates_and_orders(
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Top-N: highest score first, item_id tie-break, count <= top_n."""
-    conn, _ = db_conn_async
+    conn, _ = db_conn
     for idx, value in enumerate([0.1, 0.5, 0.3, 0.4, 0.2], start=1):
-        item_id = await insert_test_item_async(conn, market_hash=f"item-{idx}", category="arcana")
+        item_id = await insert_test_item(conn, market_hash=f"item-{idx}", category="arcana")
         await _insert_score(conn, item_id=item_id, score=value)
     await _insert_ingest_run(conn, run_id="ingest-1", status="success")
 
@@ -192,11 +192,11 @@ async def test_latest_report_top_n_truncates_and_orders(
 
 @pytest.mark.asyncio
 async def test_latest_report_serializes_null_current_price(
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Item without latest_observation → current_price stays None on the wire."""
-    conn, _ = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X", category="arcana")
+    conn, _ = db_conn
+    item_id = await insert_test_item(conn, market_hash="X", category="arcana")
     await _insert_score(conn, item_id=item_id, score=0.5)
     # No latest_observation insert.
     await _insert_ingest_run(conn, run_id="ingest-1", status="success")
@@ -210,18 +210,18 @@ async def test_latest_report_serializes_null_current_price(
 
 @pytest.mark.asyncio
 async def test_historical_report_returns_none_when_no_scores(
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
-    conn, _ = db_conn_async
+    conn, _ = db_conn
     assert await build_historical_report(conn, AS_OF) is None
 
 
 @pytest.mark.asyncio
 async def test_historical_report_happy_path(
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
-    conn, _ = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X", category="arcana")
+    conn, _ = db_conn
+    item_id = await insert_test_item(conn, market_hash="X", category="arcana")
     await _insert_score(conn, item_id=item_id, score=0.5)
 
     report = await build_historical_report(conn, AS_OF)
@@ -232,11 +232,11 @@ async def test_historical_report_happy_path(
 
 @pytest.mark.asyncio
 async def test_historical_report_different_date_returns_none(
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Scores for AS_OF don't satisfy a query for AS_OF - 1."""
-    conn, _ = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X", category="arcana")
+    conn, _ = db_conn
+    item_id = await insert_test_item(conn, market_hash="X", category="arcana")
     await _insert_score(conn, item_id=item_id, score=0.5, on=AS_OF)
     assert await build_historical_report(conn, AS_OF - timedelta(days=1)) is None
 
@@ -246,10 +246,10 @@ async def test_historical_report_different_date_returns_none(
 
 @pytest.mark.asyncio
 async def test_health_warmup_when_no_scores(
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Empty DB → status warmup, days_remaining defaults to threshold."""
-    conn, _ = db_conn_async
+    conn, _ = db_conn
     health = await build_health(conn)
     assert health.status == "warmup"
     assert health.last_run is None
@@ -261,12 +261,12 @@ async def test_health_warmup_when_no_scores(
 
 @pytest.mark.asyncio
 async def test_health_warmup_days_remaining_decreases_with_history(
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """With 10 days of history, days_remaining = 30 - 10 = 20."""
-    conn, _ = db_conn_async
+    conn, _ = db_conn
     today = datetime.now(UTC).date()
-    item_id = await insert_test_item_async(conn, market_hash="X", category="arcana")
+    item_id = await insert_test_item(conn, market_hash="X", category="arcana")
     # First observation 9 days ago → 10 days of history span.
     await _insert_price_history(conn, item_id, on=today - timedelta(days=9))
 
@@ -277,11 +277,11 @@ async def test_health_warmup_days_remaining_decreases_with_history(
 
 @pytest.mark.asyncio
 async def test_health_past_warmup_yields_null_remaining(
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
-    conn, _ = db_conn_async
+    conn, _ = db_conn
     today = datetime.now(UTC).date()
-    item_id = await insert_test_item_async(conn, market_hash="X", category="arcana")
+    item_id = await insert_test_item(conn, market_hash="X", category="arcana")
     # 60 days ago → > 30 days of history.
     await _insert_price_history(conn, item_id, on=today - timedelta(days=60))
 
@@ -291,11 +291,11 @@ async def test_health_past_warmup_yields_null_remaining(
 
 @pytest.mark.asyncio
 async def test_health_degraded_when_today_ingest_partial(
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
-    conn, _ = db_conn_async
+    conn, _ = db_conn
     today = datetime.now(UTC).date()
-    item_id = await insert_test_item_async(conn, market_hash="X", category="arcana")
+    item_id = await insert_test_item(conn, market_hash="X", category="arcana")
     await _insert_score(conn, item_id=item_id, score=0.5)
     await _insert_ingest_run(conn, run_id="ingest-partial", status="partial", on=today)
 
@@ -305,11 +305,11 @@ async def test_health_degraded_when_today_ingest_partial(
 
 @pytest.mark.asyncio
 async def test_health_last_run_is_most_recent_successful(
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
-    conn, _ = db_conn_async
+    conn, _ = db_conn
     today = datetime.now(UTC).date()
-    item_id = await insert_test_item_async(conn, market_hash="X", category="arcana")
+    item_id = await insert_test_item(conn, market_hash="X", category="arcana")
     await _insert_score(conn, item_id=item_id, score=0.5)
     await _insert_ingest_run(conn, run_id="ingest-success", status="success", on=today)
 
@@ -324,18 +324,18 @@ async def test_health_last_run_is_most_recent_successful(
 
 @pytest.mark.asyncio
 async def test_item_detail_returns_none_for_unknown(
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
-    conn, _ = db_conn_async
+    conn, _ = db_conn
     assert await build_item_detail(conn, item_id=9999) is None
 
 
 @pytest.mark.asyncio
 async def test_item_detail_happy_path(
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
-    conn, _ = db_conn_async
-    item_id = await insert_test_item_async(
+    conn, _ = db_conn
+    item_id = await insert_test_item(
         conn, market_hash="X", name="Inscribed Manifold Paradox", category="arcana"
     )
     today = datetime.now(UTC).date()

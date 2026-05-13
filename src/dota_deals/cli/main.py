@@ -42,8 +42,7 @@ from dota_deals.publish.r2 import R2Client, R2Error
 from dota_deals.publish.writer import write_atomic
 from dota_deals.scoring.runner import compute_scores_for
 from dota_deals.signals.runner import compute_signals_for
-from dota_deals.storage.db import connect
-from dota_deals.storage.db_async import connect as connect_async
+from dota_deals.storage.db import D1Connection, connect
 from dota_deals.storage.repositories import (
     active_items,
     items_missing_observation_for_date,
@@ -254,14 +253,10 @@ def _parse_date_or_today(raw: str | None) -> date:
         raise typer.BadParameter(f"invalid date {raw!r}: {e}") from e
 
 
-def _data_quality_block(settings: Settings, on: date) -> dict[str, object]:
+async def _data_quality_block(conn: D1Connection, on: date) -> dict[str, object]:
     """Build the run-level data_quality block used by the notifier."""
-    conn = connect(settings.db_path)
-    try:
-        ingest = latest_ingest_run_for_date(conn, on)
-        missing = items_missing_observation_for_date(conn, on)
-    finally:
-        conn.close()
+    ingest = await latest_ingest_run_for_date(conn, on)
+    missing = await items_missing_observation_for_date(conn, on)
     block: dict[str, object] = {}
     if ingest is None:
         block["ingest_status"] = "missing"
@@ -330,24 +325,30 @@ def report_command(
     configure_logging(run_id=parent_run_id, log_format=settings.log_format)
     log = get_logger("dota_deals.cli.report").bind(source="cli", parent_run_id=parent_run_id)
 
-    conn = connect(settings.db_path)
-    try:
-        scores = latest_scores(conn, as_of, top)
-    finally:
-        conn.close()
+    score_count = asyncio.run(_report_async(settings, as_of, top, out))
+    log.info(
+        "report emitted",
+        as_of=as_of.isoformat(),
+        score_count=score_count,
+        out=str(out) if out else "stdout",
+    )
 
-    data_quality = _data_quality_block(settings, as_of)
+
+async def _report_async(settings: Settings, as_of: date, top: int, out: Path | None) -> int:
+    """Async body of ``dota-deals report``.
+
+    Returns the number of scores emitted so the sync entry can log it
+    without re-opening the connection.
+    """
+    async with connect(settings) as conn:
+        scores = await latest_scores(conn, as_of, top)
+        data_quality = await _data_quality_block(conn, as_of)
 
     if out is None:
         stdout.emit(scores, data_quality, dest=None)
     else:
         json_file.emit(scores, data_quality, dest=out)
-    log.info(
-        "report emitted",
-        as_of=as_of.isoformat(),
-        score_count=len(scores),
-        out=str(out) if out else "stdout",
-    )
+    return len(scores)
 
 
 @app.command("publish")
@@ -404,7 +405,7 @@ async def _publish_async(
     the rows-read accumulator surfaces the publish run's total in a
     single budget-summary line.
     """
-    async with connect_async(settings) as conn:
+    async with connect(settings) as conn:
         latest = await build_latest_report(conn, top_n=top)
         write_atomic(latest, out_dir / "latest.json")
         log.info("published latest.json", status=latest.status, score_count=len(latest.scores))
@@ -475,12 +476,18 @@ def items_list_active() -> None:
     and no trailing whitespace; sorted by ``item_id`` for stable diffs.
     """
     settings = load_settings()
-    conn = connect(settings.db_path)
-    try:
-        for item in active_items(conn):
+    asyncio.run(_items_list_active_async(settings))
+
+
+async def _items_list_active_async(settings: Settings) -> None:
+    """Async body of ``dota-deals items list-active``.
+
+    Separated so tests can invoke the helper directly (typer's CliRunner
+    can't host a nested ``asyncio.run`` inside pytest-asyncio's loop).
+    """
+    async with connect(settings) as conn:
+        for item in await active_items(conn):
             typer.echo(item.market_hash)
-    finally:
-        conn.close()
 
 
 def main() -> None:

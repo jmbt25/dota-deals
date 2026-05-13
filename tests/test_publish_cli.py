@@ -27,9 +27,9 @@ import pytest
 import dota_deals.cli.main as cli_main
 from dota_deals.cli.main import _publish_async
 from dota_deals.config import Settings
-from dota_deals.storage.db_async import D1Connection
+from dota_deals.storage.db import D1Connection
 from tests._d1_fake import D1FakeClient
-from tests.conftest import insert_test_item_async
+from tests.conftest import insert_test_item
 
 AS_OF = date(2026, 5, 13)
 
@@ -37,11 +37,11 @@ AS_OF = date(2026, 5, 13)
 @pytest.mark.asyncio
 async def test_publish_writes_latest_and_health(
     tmp_path: Path,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn, fake = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X", category="arcana")
+    conn, fake = db_conn
+    item_id = await insert_test_item(conn, market_hash="X", category="arcana")
     await conn.execute(
         """
         INSERT INTO scores (item_id, computed_for, buy_score, components_json,
@@ -92,7 +92,7 @@ async def test_publish_writes_latest_and_health(
         finally:
             cli_conn.log_budget_summary()
 
-    monkeypatch.setattr(cli_main, "connect_async", fake_connect)
+    monkeypatch.setattr(cli_main, "connect", fake_connect)
 
     settings = Settings(
         _env_file=None,

@@ -13,7 +13,7 @@ these tests focus on three production-critical properties:
   signals are unaffected.
 
 Phase 9c-ii: the runner is async and writes to D1. Tests use the
-``db_conn_async`` fixture and seed the in-memory fake before invocation;
+``db_conn`` fixture and seed the in-memory fake before invocation;
 assertions read back via ``conn.query``.
 """
 
@@ -28,9 +28,9 @@ from dota_deals.config import Settings
 from dota_deals.models.domain import Signal
 from dota_deals.signals import runner as signals_runner
 from dota_deals.signals.dataset import DataLookup
-from dota_deals.storage.db_async import D1Connection
+from dota_deals.storage.db import D1Connection
 from tests._d1_fake import D1FakeClient
-from tests.conftest import insert_test_item_async
+from tests.conftest import insert_test_item
 
 AS_OF = date(2026, 5, 13)
 
@@ -102,15 +102,15 @@ async def _count(conn: D1Connection, sql: str, params: tuple[Any, ...] = ()) -> 
 @pytest.mark.asyncio
 async def test_fully_warm_item_gets_four_signal_rows(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """All four signals computed and persisted for a fully-warm item."""
-    conn, fake = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X", category="arcana")
+    conn, fake = db_conn
+    item_id = await insert_test_item(conn, market_hash="X", category="arcana")
     # Three peers so comparables clears the ≥3-peer threshold.
-    p1 = await insert_test_item_async(conn, market_hash="P1", category="arcana")
-    p2 = await insert_test_item_async(conn, market_hash="P2", category="arcana")
-    p3 = await insert_test_item_async(conn, market_hash="P3", category="arcana")
+    p1 = await insert_test_item(conn, market_hash="P1", category="arcana")
+    p2 = await insert_test_item(conn, market_hash="P2", category="arcana")
+    p3 = await insert_test_item(conn, market_hash="P3", category="arcana")
     for iid in (item_id, p1, p2, p3):
         await _populate_full_history(conn, iid)
 
@@ -133,15 +133,15 @@ async def test_fully_warm_item_gets_four_signal_rows(
 @pytest.mark.asyncio
 async def test_partial_history_item_still_emits_four_rows_with_nulls(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Insufficient-history items still get four rows; some values are null.
 
     Downstream coverage reporting depends on (item, signal_name) being
     present regardless of computability.
     """
-    conn, fake = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="NEW", category="arcana")
+    conn, fake = db_conn
+    item_id = await insert_test_item(conn, market_hash="NEW", category="arcana")
     # No history populated — every signal will be null.
 
     await signals_runner.compute_signals_for(AS_OF, settings, run_id="r2", backend=fake)
@@ -169,13 +169,13 @@ async def test_partial_history_item_still_emits_four_rows_with_nulls(
 @pytest.mark.asyncio
 async def test_idempotent_rerun_does_not_double_write(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Two runs for the same date → still exactly four rows per item."""
-    conn, fake = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X", category="arcana")
+    conn, fake = db_conn
+    item_id = await insert_test_item(conn, market_hash="X", category="arcana")
     for i in range(3):
-        peer = await insert_test_item_async(conn, market_hash=f"P{i}", category="arcana")
+        peer = await insert_test_item(conn, market_hash=f"P{i}", category="arcana")
         await _populate_full_history(conn, peer)
     await _populate_full_history(conn, item_id)
 
@@ -197,11 +197,11 @@ async def test_idempotent_rerun_does_not_double_write(
 @pytest.mark.asyncio
 async def test_runs_row_carries_parent_and_kind(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """The runs row is tagged kind='signals' and links to its parent_run_id."""
-    conn, fake = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X", category="arcana")
+    conn, fake = db_conn
+    item_id = await insert_test_item(conn, market_hash="X", category="arcana")
     await _populate_full_history(conn, item_id)
 
     await signals_runner.compute_signals_for(
@@ -220,13 +220,13 @@ async def test_runs_row_carries_parent_and_kind(
 @pytest.mark.asyncio
 async def test_per_item_per_signal_exception_isolated(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A raising signal compute → null row for that (item, signal); others unaffected."""
-    conn, fake = db_conn_async
-    a = await insert_test_item_async(conn, market_hash="A", category="arcana")
-    b = await insert_test_item_async(conn, market_hash="B", category="arcana")
+    conn, fake = db_conn
+    a = await insert_test_item(conn, market_hash="A", category="arcana")
+    b = await insert_test_item(conn, market_hash="B", category="arcana")
     for iid in (a, b):
         await _populate_full_history(conn, iid)
 
@@ -274,7 +274,7 @@ async def test_per_item_per_signal_exception_isolated(
 @pytest.mark.asyncio
 async def test_resumable_after_partial_prior_run(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """A prior partial run left two signals in the table; the rerun fills the
     remaining two without duplicating the existing rows.
@@ -283,10 +283,10 @@ async def test_resumable_after_partial_prior_run(
     DB lock) after writing only part of an item's signals. Re-running the
     same date must converge to four rows per item with no churn.
     """
-    conn, fake = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X", category="arcana")
+    conn, fake = db_conn
+    item_id = await insert_test_item(conn, market_hash="X", category="arcana")
     for i in range(3):
-        peer = await insert_test_item_async(conn, market_hash=f"P{i}", category="arcana")
+        peer = await insert_test_item(conn, market_hash=f"P{i}", category="arcana")
         await _populate_full_history(conn, peer)
     await _populate_full_history(conn, item_id)
 

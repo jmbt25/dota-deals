@@ -40,9 +40,8 @@ from dota_deals.config import Settings
 from dota_deals.logging import get_logger
 from dota_deals.models.domain import BuyScore, Item, RunStatus, RunSummary, Signal
 from dota_deals.scoring.buy_score import compute_buy_score
-from dota_deals.storage.db import StorageError
-from dota_deals.storage.db_async import D1Backend, connect
-from dota_deals.storage.repositories_async import (
+from dota_deals.storage.db import D1Backend, StorageError, connect
+from dota_deals.storage.repositories import (
     active_items,
     insert_run,
     insert_scores,

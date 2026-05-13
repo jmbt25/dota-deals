@@ -31,7 +31,7 @@ Fidelity notes:
 * ``batch()`` runs in a transaction — any statement raising rolls the
   whole batch back, matching D1's documented atomicity.
 * Use as an async context manager so the ``async with`` semantics in
-  callers (e.g. :func:`dota_deals.storage.db_async.connect`) work
+  callers (e.g. :func:`dota_deals.storage.db.connect`) work
   unchanged.
 """
 

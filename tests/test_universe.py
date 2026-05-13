@@ -13,7 +13,7 @@ Covers the cases enumerated in the Phase 4a brief:
 Search-endpoint mocking matches by the ``category_570_Rarity[]`` query param
 so a single respx route can serve both rarities with different bodies.
 
-Phase 9c-iii: storage moves to async D1. Tests use the ``db_conn_async``
+Phase 9c-iii: storage moves to async D1. Tests use the ``db_conn``
 fixture and pass ``backend=fake`` to :func:`refresh_universe`.
 """
 
@@ -28,7 +28,7 @@ import respx
 
 from dota_deals.config import Settings
 from dota_deals.ingest.universe import refresh_universe
-from dota_deals.storage.db_async import D1Connection
+from dota_deals.storage.db import D1Connection
 from tests._d1_fake import D1FakeClient
 
 SEARCH_URL = "https://steamcommunity.com/market/search/render"
@@ -98,10 +98,10 @@ async def _count(conn: D1Connection, table: str) -> int:
 @pytest.mark.asyncio
 async def test_happy_path_single_page_per_rarity(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 1: each rarity returns one page; every result upserts into items."""
-    conn, fake = db_conn_async
+    conn, fake = db_conn
     arcana_page = _page(
         total_count=2,
         start=0,
@@ -145,10 +145,10 @@ async def test_happy_path_single_page_per_rarity(
 @pytest.mark.asyncio
 async def test_pagination_terminates_when_start_reaches_total_count(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 2: three pages of two arcanas each (total_count=6), one page of immortals."""
-    conn, fake = db_conn_async
+    conn, fake = db_conn
     arcana_pages = [
         _page(total_count=6, start=0, results=[_result(f"Arc{i}") for i in range(2)]),
         _page(total_count=6, start=2, results=[_result(f"Arc{i}") for i in range(2, 4)]),
@@ -177,10 +177,10 @@ async def test_pagination_terminates_when_start_reaches_total_count(
 @pytest.mark.asyncio
 async def test_4xx_on_one_rarity_partials_the_run(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 3: 404 on arcanas → that category fails; immortals still upsert."""
-    conn, fake = db_conn_async
+    conn, fake = db_conn
     immortal_page = _page(
         total_count=1, start=0, results=[_result("Riptide Raider", type_="Immortal Item")]
     )
@@ -203,10 +203,10 @@ async def test_4xx_on_one_rarity_partials_the_run(
 @pytest.mark.asyncio
 async def test_malformed_response_routes_to_quarantine(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 4: a JSON body that doesn't match the search schema is quarantined."""
-    conn, fake = db_conn_async
+    conn, fake = db_conn
     bad_page = httpx.Response(
         200,
         json={
@@ -244,10 +244,10 @@ async def test_malformed_response_routes_to_quarantine(
 @pytest.mark.asyncio
 async def test_reactivation_when_item_reappears(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Case 6: deactivated item with strikes is reactivated and counter resets."""
-    conn, fake = db_conn_async
+    conn, fake = db_conn
     await conn.execute(
         """
         INSERT INTO items (

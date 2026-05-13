@@ -8,7 +8,7 @@ These exercise the scoring stage's three production-critical properties:
   the ingest run's state (success / partial / failed / missing) and whether
   this particular item was in the ingest's coverage gap.
 
-Phase 9c-iii: storage moves to async D1. Tests use ``db_conn_async`` and
+Phase 9c-iii: storage moves to async D1. Tests use ``db_conn`` and
 pass ``backend=fake`` to :func:`compute_scores_for`.
 """
 
@@ -23,9 +23,9 @@ import pytest
 from dota_deals.config import Settings
 from dota_deals.models.domain import RunSummary
 from dota_deals.scoring.runner import compute_scores_for
-from dota_deals.storage.db_async import D1Connection
+from dota_deals.storage.db import D1Connection
 from tests._d1_fake import D1FakeClient
-from tests.conftest import insert_test_item_async
+from tests.conftest import insert_test_item
 
 AS_OF = date(2026, 5, 12)
 
@@ -103,10 +103,10 @@ async def _count(conn: D1Connection, sql: str, params: tuple[Any, ...] = ()) -> 
 @pytest.mark.asyncio
 async def test_score_row_written_for_fully_warm_item(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
-    conn, fake = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X")
+    conn, fake = db_conn
+    item_id = await insert_test_item(conn, market_hash="X")
     await _seed_full_signals(conn, item_id)
     await _seed_price_observation_on(conn, item_id, on=AS_OF)
     await _seed_ingest_run(
@@ -152,10 +152,10 @@ async def test_score_row_written_for_fully_warm_item(
 @pytest.mark.asyncio
 async def test_runs_row_carries_parent_and_kind(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
-    conn, fake = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X")
+    conn, fake = db_conn
+    item_id = await insert_test_item(conn, market_hash="X")
     await _seed_full_signals(conn, item_id)
 
     await compute_scores_for(
@@ -178,10 +178,10 @@ async def test_runs_row_carries_parent_and_kind(
 @pytest.mark.asyncio
 async def test_item_with_three_null_signals_gets_no_score_row(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
-    conn, fake = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="LIGHT")
+    conn, fake = db_conn
+    item_id = await insert_test_item(conn, market_hash="LIGHT")
     await _insert_signal(conn, item_id=item_id, signal_name="price_zscore", value=0.5)
     await _insert_signal(conn, item_id=item_id, signal_name="supply_velocity", value=None)
     await _insert_signal(conn, item_id=item_id, signal_name="event_proximity", value=None)
@@ -198,15 +198,15 @@ async def test_item_with_three_null_signals_gets_no_score_row(
 @pytest.mark.asyncio
 async def test_item_with_no_signals_at_all_gets_no_score(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """If signals.runner never wrote a row for this item, scorer skips it.
 
     Matches the "3+ nulls → None" contract: the item didn't have enough
     inputs to produce a score, full stop.
     """
-    conn, fake = db_conn_async
-    await insert_test_item_async(conn, market_hash="GHOST")
+    conn, fake = db_conn
+    await insert_test_item(conn, market_hash="GHOST")
 
     summary = await compute_scores_for(AS_OF, settings, run_id="score-ghost", backend=fake)
     assert summary.items_failed == 1
@@ -219,10 +219,10 @@ async def test_item_with_no_signals_at_all_gets_no_score(
 @pytest.mark.asyncio
 async def test_idempotent_rerun_does_not_double_write(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
-    conn, fake = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X")
+    conn, fake = db_conn
+    item_id = await insert_test_item(conn, market_hash="X")
     await _seed_full_signals(conn, item_id)
 
     await compute_scores_for(AS_OF, settings, run_id="score-a", backend=fake)
@@ -245,10 +245,10 @@ async def test_idempotent_rerun_does_not_double_write(
 @pytest.mark.asyncio
 async def test_partial_ingest_propagates_to_score_data_quality(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
-    conn, fake = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X")
+    conn, fake = db_conn
+    item_id = await insert_test_item(conn, market_hash="X")
     await _seed_full_signals(conn, item_id)
     await _seed_price_observation_on(conn, item_id, on=AS_OF)
     await _seed_ingest_run(
@@ -269,12 +269,12 @@ async def test_partial_ingest_propagates_to_score_data_quality(
 @pytest.mark.asyncio
 async def test_item_missing_from_ingest_flagged_in_data_quality(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
     """Item has signals (maybe from cached/derived data) but no price_history
     on the date — data_quality_json must surface that."""
-    conn, fake = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="STALE")
+    conn, fake = db_conn
+    item_id = await insert_test_item(conn, market_hash="STALE")
     await _seed_full_signals(conn, item_id)
     # Note: no _seed_price_observation_on for AS_OF.
     await _seed_ingest_run(
@@ -294,10 +294,10 @@ async def test_item_missing_from_ingest_flagged_in_data_quality(
 @pytest.mark.asyncio
 async def test_no_ingest_run_for_date_yields_missing_status(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
-    conn, fake = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X")
+    conn, fake = db_conn
+    item_id = await insert_test_item(conn, market_hash="X")
     await _seed_full_signals(conn, item_id)
     # No ingest run inserted for AS_OF — but signals exist (e.g., from a
     # historical recompute).
@@ -312,10 +312,10 @@ async def test_no_ingest_run_for_date_yields_missing_status(
 @pytest.mark.asyncio
 async def test_null_signals_listed_in_data_quality(
     settings: Settings,
-    db_conn_async: tuple[D1Connection, D1FakeClient],
+    db_conn: tuple[D1Connection, D1FakeClient],
 ) -> None:
-    conn, fake = db_conn_async
-    item_id = await insert_test_item_async(conn, market_hash="X")
+    conn, fake = db_conn
+    item_id = await insert_test_item(conn, market_hash="X")
     await _insert_signal(conn, item_id=item_id, signal_name="price_zscore", value=0.5)
     await _insert_signal(conn, item_id=item_id, signal_name="supply_velocity", value=0.4)
     await _insert_signal(conn, item_id=item_id, signal_name="event_proximity", value=None)

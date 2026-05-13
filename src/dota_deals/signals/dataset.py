@@ -40,8 +40,8 @@ from datetime import date
 
 from dota_deals.models.domain import Item, ItemCategory, LatestObservation, ListingPoint
 from dota_deals.models.events import EventRecord
-from dota_deals.storage.db_async import D1Connection
-from dota_deals.storage.repositories_async import (
+from dota_deals.storage.db import D1Connection
+from dota_deals.storage.repositories import (
     active_items,
     daily_prices_for_items,
     latest_observations_all,

@@ -42,8 +42,8 @@ from dota_deals.ingest.steam import (
 )
 from dota_deals.logging import get_logger
 from dota_deals.models.domain import Item, ItemCategory, RunStatus, RunSummary
-from dota_deals.storage.db_async import D1Backend, D1Connection, connect
-from dota_deals.storage.repositories_async import (
+from dota_deals.storage.db import D1Backend, D1Connection, connect
+from dota_deals.storage.repositories import (
     insert_run,
     quarantine_record,
     update_run,
