@@ -1,0 +1,27 @@
+# Files excluded from `wrangler pages deploy`.
+#
+# Cloudflare Pages reads this the same way git reads .gitignore.
+# Entries here keep dev-only artifacts out of the deploy bundle and,
+# more importantly, prevent the deploy from tripping Pages' 25 MiB
+# per-file limit on cached SQLite databases that tooling leaves
+# behind. The Phase 11 first-deploy attempt blew up on
+# `.mypy_cache/3.12/cache.db` (26.6 MiB); this file is the
+# permanent fix so a future operator running `wrangler pages
+# deploy .` (instead of the documented `wrangler pages deploy
+# public`) doesn't hit the same wall.
+
+# Python tooling caches.
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+
+# Python virtual environment.
+.venv/
+
+# Node tooling.
+node_modules/
+
+# Wrangler's local state (D1 shim, build metadata).
+.wrangler/

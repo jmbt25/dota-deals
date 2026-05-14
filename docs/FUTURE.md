@@ -3,6 +3,83 @@
 Items intentionally left out of v1 with explicit scope so a future contributor
 (or future me) can pick them up cleanly.
 
+## Steam Market 403s at universe scale
+
+**Status:** confirmed at full production scale during Phase 11's
+verification deploy. A real ingest run against the live universe
+(~1,765 active items) produced `items_ok=19`, `items_failed=174`
+on the partial sample observed via `/api/runs` — roughly a **90%
+rejection rate** from Steam's `priceoverview` endpoint, all 403s,
+on the items that actually got through the request budget before
+the run ended. The pipeline handled it gracefully: the failing
+items routed through the existing 4xx-strike + no-exact-match
+paths (pinned by `test_runner_4xx_run_continues` and
+`test_runner_failed_when_no_exact_match`), the run terminated
+with `status=partial` rather than failed, and the surfaced
+counters made the situation obvious from `/api/runs` without
+operator log-diving.
+
+**Why it shows up at scale and not in earlier smokes:** the
+2-item and ~10-item smokes during Phase 9c-i and Phase 10
+exercised hand-picked, broadly available arcanas that Steam
+serves without resistance. The full-universe run includes a long
+tail of low-volume, gift-disabled, or out-of-market items that
+Steam's anti-scraping heuristics treat differently — possibly
+because the listing pages for those items are 403-walled from
+unauthenticated clients regardless of request shape. We didn't
+discover this until Phase 11's `/api/runs` endpoint surfaced a
+real partial run's counters end-to-end.
+
+**Why deferred:** the workarounds are non-trivial and the
+graceful-degradation path is honest. v2 ships with the limitation
+acknowledged in the wire-format `data_quality.ingest_status:
+"partial"` field and in the surfaced runs row. Users who care
+about coverage gaps can see them in `/api/health`'s
+`data_coverage.items_with_signals` count; users who don't aren't
+mislead by silently fabricated data.
+
+**Strategy options for v3+:**
+
+1. **User-Agent rotation.** Cycle a small pool of realistic
+   browser User-Agents per request. Lowest-effort change; likely
+   gets some fraction of the 90% back. Risk: Steam may already be
+   keying off subtler fingerprints (TLS JA3, request timing) and
+   UA changes won't move the needle. Easy to test in isolation.
+2. **Request-pattern shuffling.** Randomize per-item poll order
+   per run instead of iterating the items table in PK order,
+   add jitter to the inter-request delay beyond what the existing
+   429 cool-down provides, occasionally interleave a non-market
+   Steam request (community-page fetch) to look more like a
+   browser session. Higher complexity, harder to measure
+   improvement without an A/B framework.
+3. **Distributed origin IPs.** Run ingest from multiple
+   geographically-distinct egress IPs (Cloudflare Workers, a
+   small fleet of cloud VMs, etc.) and shard the universe across
+   them. Highest infrastructure cost, likely the most durable
+   solution. The GHA runner pool may already provide some IP
+   diversity but we haven't measured it.
+4. **Scope narrowing.** Restrict the active universe to a curated
+   subset of high-volume / high-interest items where the 403 rate
+   is empirically lower. Loses breadth but trades for daily
+   coverage on the items users actually want signals for. This is
+   the lowest-risk v3 move and may be the right v2.1 if the v2
+   public surface drives feedback toward "I want this for THESE
+   specific arcanas, not the whole tail."
+
+**What would have to be true to start it:** v2 ships and operates
+unattended for ≥ 30 days, and either (a) the 403 rate trends up
+above ~95% (signaling Steam is tightening further), or (b) user
+feedback specifies coverage on items currently in the 403'd
+fraction, or (c) the team has bandwidth to A/B test the
+mitigations in (1)/(2) against the current production rate as a
+control.
+
+Until then, the pipeline does the honest thing: ingest what
+Steam will serve, surface the gap in `data_quality`, compute
+signals only for items that have observations. The Phase 11
+`/api/health` and `/api/runs` endpoints are the operator-visible
+signal for whether the rate is trending the wrong way.
+
 ## Hero-name parsing for `items.hero`
 
 **Status:** every row inserted by `ingest.universe.refresh_universe` currently

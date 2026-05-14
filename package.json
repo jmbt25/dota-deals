@@ -9,7 +9,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "dev": "wrangler pages dev .",
-    "deploy": "wrangler pages deploy . --project-name=dota-deals"
+    "deploy": "wrangler pages deploy public --project-name=dota-deals --branch=main"
   },
   "dependencies": {
     "hono": "^4.6.0"
