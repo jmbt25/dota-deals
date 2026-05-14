@@ -1,0 +1,66 @@
+name: deploy
+
+# Manual-only Cloudflare Pages deploy. Added in Phase 12 to bypass a
+# regional outage (Cloudflare's Manila edge in extended maintenance
+# blocked `npm run deploy` from the operator's machine), but the value
+# is durable: deploys now ship from GitHub's US-based runners
+# regardless of which Cloudflare edge the operator's local network
+# resolves to.
+#
+# Phase 13 may add a `push:` trigger for auto-deploy on main. For now
+# this is operator-driven: trigger via Actions tab → deploy →
+# "Run workflow", or via `gh workflow run deploy.yml`.
+
+on:
+  workflow_dispatch:
+
+# No git writes, no PR comments — only network egress to Cloudflare's
+# API. Pages Functions and static assets get uploaded; nothing in this
+# repo changes.
+permissions:
+  contents: read
+
+# Don't let two manual deploys race to upload the same artifact. The
+# pipeline workflow has its own `pipeline` group; this is distinct.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  # Read by wrangler. CLOUDFLARE_API_TOKEN was extended with
+  # `Cloudflare Pages: Edit` scope in Phase 11; CLOUDFLARE_ACCOUNT_ID
+  # is required so wrangler doesn't fall back to `/memberships`
+  # (which the token's scope can't read — see Phase 10's
+  # 37bc3bb diagnostic).
+  CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install deps
+        # Uses package-lock.json for a reproducible install. The only
+        # production dep wrangler needs is itself + hono; everything
+        # else is devDependencies pulled for completeness.
+        run: npm ci
+
+      - name: Deploy to Cloudflare Pages
+        # `public` is the static-asset dir (per pages_build_output_dir
+        # in wrangler.toml); `functions/` is auto-discovered from the
+        # project root. `--branch=main` pins the production lane so
+        # the deploy lands on the `*.pages.dev` canonical URL, not a
+        # preview subdomain. Passing `.` here trips the 25-MiB-per-file
+        # cap on dev-cache directories — see docs/DEPLOYMENT.md
+        # "Lessons from Phase 11 deploy" entry 2.
+        run: npx wrangler pages deploy public --project-name=dota-deals --branch=main
