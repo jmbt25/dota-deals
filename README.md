@@ -83,12 +83,6 @@ ORDER BY started_at DESC
 LIMIT 20;
 ```
 
-The operational details (recompute recipes, data-quality fields,
-warmup windows, failure modes in the logs) live in
-[`docs/INGESTION.md`](docs/INGESTION.md), [`docs/UNIVERSE.md`](docs/UNIVERSE.md),
-[`docs/SIGNALS.md`](docs/SIGNALS.md), and
-[`docs/SCORING.md`](docs/SCORING.md).
-
 ### Frontend
 
 The single-page frontend at [`public/index.html`](public/index.html)
@@ -123,9 +117,7 @@ npx wrangler d1 execute dota-deals --local --file=functions/__tests__/seed.sql
 ```
 
 `curl http://localhost:8788/api/health` should then return
-`status: "operational"` against the four-item baseline. See
-[`docs/WORKER_API.md`](docs/WORKER_API.md) for the local-dev
-recipe in full.
+`status: "operational"` against the four-item baseline.
 
 **Local-dev caveat:** `wrangler pages dev` (as of 4.90.1) serves
 the Functions at `/api/*` correctly but 404s on the static
@@ -161,14 +153,8 @@ logic carries through.
 Frontend deploys are **operator-triggered** via `npm run deploy`
 (which calls `wrangler pages deploy public --project-name=dota-deals
 --branch=main`). The Pages dashboard's Git auto-deploy is
-deliberately off — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
-"Lessons from Phase 11 deploy" for the build-token-recurrence
-history that motivated that choice.
-
-Full setup — Cloudflare API tokens, GitHub secrets, Pages connection,
-the D1 schema migration commands, failure recovery — is in
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). The storage-layer
-architecture is in [docs/D1_MIGRATION.md](docs/D1_MIGRATION.md).
+deliberately off — recurring build-token invalidation made the
+manual path more reliable.
 
 The scheduled cadence:
 
@@ -192,27 +178,14 @@ respx-mocked test suite exercises the full pipeline; real-Steam +
 real-D1 smoke tests at each cutover phase caught the bugs no mock
 could (Steam React-SSR endpoint rename, D1 batch wire shape, D1
 100-variable limit, Pages 25-MiB-per-file deploy limit, recurring
-build-token invalidation) — see [docs/D1_MIGRATION.md](docs/D1_MIGRATION.md)
-"Lessons the smoke tests taught us" and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
-"Lessons from Phase 11 deploy" for the full list.
+build-token invalidation).
 
 Warmup is real: from a cold start, the first 14 days produce no signals,
 days 14–29 produce supply-only signals, and `event_proximity` stays
-category-fallback-only until the second TI cycle of operation. SPEC.md
-calls this out as the "Signal warmup" trade-off.
-
-## Design docs
-
-- [`docs/SPEC.md`](docs/SPEC.md) — product spec, the four signal formulas,
-  the composite buy-score weights, success criteria.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — module boundaries, the
-  SQLite schema, the error-handling table, the concurrency model.
-- [`docs/SCORING.md`](docs/SCORING.md) — renormalization by example,
-  data_quality fields, the `event_proximity = null` convention.
+category-fallback-only until the second TI cycle of operation.
 
 ## What's not built
 
-See [`docs/FUTURE.md`](docs/FUTURE.md) for the post-v1 list: hero-name
-parsing, backtesting harness (success criterion #3), scheduler /
-deployment wiring, web frontend, CS:GO/CS2 expansion. Each entry says
-why it's deferred and what would have to be true to start it.
+Post-v1: hero-name parsing, backtesting harness (success criterion #3),
+expanded item categories (couriers, sets, treasures), CS:GO/CS2
+expansion.

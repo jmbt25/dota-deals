@@ -217,6 +217,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Internal design docs and assistant context — kept local, not shared publicly.
+CLAUDE.md
+docs/
+
 # dota-deals
 *.db
 *.db-journal
