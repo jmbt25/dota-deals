@@ -70,12 +70,12 @@ Prerequisites:
 npm install          # one-time; installs hono, wrangler, vitest, types
 ```
 
-### Run the API + static frontend together
+### Run the API locally
 
 ```bash
-npx wrangler pages dev .
-# Open http://localhost:8788 — the static frontend served from public/.
-# The /api/* routes are Functions, served from functions/api/*.ts.
+npx wrangler pages dev
+# /api/* routes are Functions, served from functions/api/*.ts.
+# Probe them via curl: curl http://localhost:8788/api/health
 ```
 
 Local D1 setup (first run only):
@@ -83,13 +83,38 @@ Local D1 setup (first run only):
 ```bash
 # Create a local shim D1 (wrangler keeps it in .wrangler/).
 npx wrangler d1 migrations apply dota-deals --local
-# Seed it with a few rows so endpoints render non-trivially.
-# (Tests use functions/__tests__/seed.sql; for live local dev, write
-# a few INSERTs against your local D1 via wrangler d1 execute.)
+
+# Optional: seed it with the test baseline (4 items, scores, runs)
+# so endpoints render non-trivially. The same SQL the vitest suite
+# applies before every test.
+npx wrangler d1 execute dota-deals --local --file=functions/__tests__/seed.sql
 ```
 
 The `--local` flag points wrangler at the in-process SQLite shim instead
 of remote D1. Production data is never touched by local dev.
+
+### Local-dev static-asset quirk
+
+As of wrangler 4.90.1, `wrangler pages dev` serves the Functions at
+`/api/*` correctly but returns 404 on the static frontend at `/`.
+Tried with the directory arg as `.`, `public`, and omitted —
+all three reproduce. Production Pages deploys serve both static
+and Functions correctly (verified end-to-end on the Phase 11 and
+Phase 12 ships), so this is a dev-server quirk in wrangler 4.x
+rather than a project issue. Workaround paths:
+
+1. **For API work:** use `wrangler pages dev` and curl `/api/*`
+   endpoints directly. Vitest is the better path for repeatable
+   behavioural testing.
+2. **For frontend visual work:** deploy to a preview URL via
+   `npm run deploy` and inspect at the returned `*.pages.dev`
+   URL. Each deploy gets a unique commit-prefixed subdomain so
+   you can iterate without affecting the canonical
+   `dotadeals.com`.
+
+If a future wrangler release fixes the local static-asset
+serving, both this section and the README's local-dev block
+collapse to "just run `wrangler pages dev` and open localhost".
 
 ### Run the tests
 

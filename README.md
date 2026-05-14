@@ -91,47 +91,60 @@ warmup windows, failure modes in the logs) live in
 
 ### Frontend
 
-The single-page frontend at [`public/index.html`](public/index.html) is
-a vanilla-JS static site that `fetch()`es `data/*.json` siblings — no
-build step, no framework, no API layer. The pipeline writes the JSON
-files; Cloudflare Pages (Phase 8) serves them.
+The single-page frontend at [`public/index.html`](public/index.html)
+is a vanilla-JS static site — no build step, no framework. It
+`fetch()`es five endpoints from the same-origin Pages Functions
+API (Phase 11) and renders one of five states (LOADING, WARMUP,
+OPERATIONAL, DEGRADED, ERROR) based on the responses:
 
-`fetch()` from `file://` is blocked by browsers, so serve `public/` over
-HTTP locally:
+| Endpoint | Used for |
+|---|---|
+| `/api/health` | Status banner, last-run timestamp, warmup countdown |
+| `/api/report/latest` | The top-N table on the operational view |
+| `/api/report/:date` | Historical date-picker lookups |
+| `/api/items/:id` | Lazy-loaded per-row expand panel (chevron click) |
 
-```bash
-cd public/
-python -m http.server 8000
-# visit http://localhost:8000
-```
+The same HTML works at `dota-deals.pages.dev` and `dotadeals.com` —
+endpoints are root-relative paths, no scheme or host hardcoded.
 
-The frontend has five explicit states — LOADING, WARMUP, OPERATIONAL,
-DEGRADED, ERROR — driven by `health.json.status` and `latest.json.scores`.
-Hand-crafted JSON fixtures in
-[`public/data/fixtures/`](public/data/fixtures/) let you exercise each
-state without running the pipeline:
+To run the API locally against a miniflare-shimmed D1:
 
 ```bash
-# operational
-cp public/data/fixtures/latest-operational.json public/data/latest.json
-cp public/data/fixtures/health-operational.json public/data/health.json
-mkdir -p public/data/items
-cp public/data/fixtures/items/1.json             public/data/items/1.json
-
-# warmup (cold-start, no scores yet)
-cp public/data/fixtures/latest-warmup.json   public/data/latest.json
-cp public/data/fixtures/health-warmup.json   public/data/health.json
-
-# degraded (ingest ran partial)
-cp public/data/fixtures/latest-degraded.json public/data/latest.json
-cp public/data/fixtures/health-degraded.json public/data/health.json
-
-# error: delete or rename one of those files — the fetch will 404 and
-# the frontend renders the error state with a Retry button
+npm install                # one-time, installs hono + wrangler + types
+npx wrangler d1 migrations apply dota-deals --local   # one-time, applies schema
+npx wrangler pages dev     # http://localhost:8788
 ```
 
-Refresh the browser after each swap. The wire-format contract is documented
-in [`docs/PUBLISH.md`](docs/PUBLISH.md); the fixtures conform to it.
+The local D1 is empty by default. To exercise non-warmup state,
+seed it from the test fixture:
+
+```bash
+npx wrangler d1 execute dota-deals --local --file=functions/__tests__/seed.sql
+```
+
+`curl http://localhost:8788/api/health` should then return
+`status: "operational"` against the four-item baseline. See
+[`docs/WORKER_API.md`](docs/WORKER_API.md) for the local-dev
+recipe in full.
+
+**Local-dev caveat:** `wrangler pages dev` (as of 4.90.1) serves
+the Functions at `/api/*` correctly but 404s on the static
+frontend at `/`. The production deploy serves both correctly —
+this is a wrangler-4 dev-server quirk, not a project issue. For
+visual frontend work today, the verification path is "deploy to a
+preview URL via `npm run deploy`, view at the `*.pages.dev`
+preview URL." A wrangler upstream fix would let `wrangler pages
+dev` serve the full stack locally; until then, the API can be
+exercised via curl as shown above and the frontend visually
+against the preview deploy.
+
+The wire-format contract for every endpoint is documented in
+[`functions/types.ts`](functions/types.ts), kept in lock-step with
+the Pydantic models in [`src/dota_deals/publish/models.py`](src/dota_deals/publish/models.py)
+that the publish layer used pre-Phase-11. Hand-crafted state
+fixtures still live in [`public/data/fixtures/`](public/data/fixtures/)
+as reference artifacts of the wire format; they are no longer
+load-bearing for local dev. Phase 13 will retire them.
 
 ## Deployment
 
@@ -139,12 +152,19 @@ The system runs unattended on **GitHub Actions** (8-hourly cron in
 [.github/workflows/pipeline.yml](.github/workflows/pipeline.yml)),
 storing all data in **Cloudflare D1** via the public REST API. The
 frontend is hosted on **Cloudflare Pages** at
-[dotadeals.com](https://dotadeals.com) and is **intentionally stale
-through Phases 10 – 12** of the migration: the pipeline no longer
-generates `public/data/` JSON; Phase 11 builds a TypeScript Worker
-that reads D1 directly; Phase 12 points the frontend at the Worker.
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the "Known gap"
-section that explains this in operational terms.
+[dotadeals.com](https://dotadeals.com) and reads from same-origin
+**Pages Functions** (Phase 11) that query D1 directly — no static
+JSON in the deploy path. Frontend code is unchanged in structure
+from the Phase 7 vanilla-JS site; Phase 12 swapped its `fetch()`
+URLs from `/data/*.json` to `/api/*` and the rest of the rendering
+logic carries through.
+
+Frontend deploys are **operator-triggered** via `npm run deploy`
+(which calls `wrangler pages deploy public --project-name=dota-deals
+--branch=main`). The Pages dashboard's Git auto-deploy is
+deliberately off — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
+"Lessons from Phase 11 deploy" for the build-token-recurrence
+history that motivated that choice.
 
 Full setup — Cloudflare API tokens, GitHub secrets, Pages connection,
 the D1 schema migration commands, failure recovery — is in
@@ -164,16 +184,18 @@ signals + score against existing data after a fix.
 
 ## Status
 
-**v1 shipped, migration to Cloudflare D1 + Worker API in progress.**
-Five pipeline stages implemented and running against D1 on the
-scheduled cron. Mid-migration, the frontend is on a planned-stale
-window through Phase 12 (see Deployment above and
-[docs/D1_MIGRATION.md](docs/D1_MIGRATION.md) for the eight-commit
-narrative). The respx-mocked test suite exercises the full pipeline;
-real-Steam + real-D1 smoke tests at each cutover phase caught the
-bugs no mock could (Steam React-SSR endpoint rename, D1 batch wire
-shape, D1 100-variable limit) — see the D1_MIGRATION doc for the
-list.
+**v1 shipped, migration to Cloudflare D1 + Worker API complete at
+the storage and frontend-fetch layer.** Five pipeline stages
+implemented and running against D1 on the scheduled cron. Five
+Pages Functions endpoints serving the frontend at `/api/*`.
+Frontend's `fetch()` calls point at the API as of Phase 12. The
+respx-mocked test suite exercises the full pipeline; real-Steam +
+real-D1 smoke tests at each cutover phase caught the bugs no mock
+could (Steam React-SSR endpoint rename, D1 batch wire shape, D1
+100-variable limit, Pages 25-MiB-per-file deploy limit, recurring
+build-token invalidation) — see [docs/D1_MIGRATION.md](docs/D1_MIGRATION.md)
+"Lessons the smoke tests taught us" and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
+"Lessons from Phase 11 deploy" for the full list.
 
 Warmup is real: from a cold start, the first 14 days produce no signals,
 days 14–29 produce supply-only signals, and `event_proximity` stays

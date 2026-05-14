@@ -1200,7 +1200,7 @@ const SIGNAL_TOOLTIPS = {
 };
 const COMPOSITE_WEIGHTS = { price: 0.35, supply: 0.35, event: 0.20, peers: 0.10 };
 
-/** Adapt one WireScore from latest.json / history/<date>.json into the
+/** Adapt one WireScore from /api/report/latest or /api/report/<date> into the
  *  table-row shape the renderers below use. Wire-format prices stay as
  *  strings ("34.50"); only chart code converts to Number(). */
 function adaptWireScore(score, rank) {
@@ -1317,8 +1317,8 @@ async function bootstrap() {
   renderSkeletonRows(10);
   try {
     const [health, latest] = await Promise.all([
-      fetchJSON('data/health.json'),
-      fetchJSON('data/latest.json'),
+      fetchJSON('/api/health'),
+      fetchJSON('/api/report/latest'),
     ]);
     App.health = health;
     App.latest = latest;
@@ -1402,7 +1402,7 @@ function setState(state, err = null) {
       if (err) {
         dom.errorMsg.textContent =
           err instanceof FetchError && err.status === 404
-            ? 'Report file not found at /data/latest.json or /data/health.json.'
+            ? 'API endpoint not found — the deploy may be missing or misconfigured.'
             : 'Network or server error fetching the report.';
         dom.errorSub.textContent = err.url ? `${err.url} → ${err.message}` : err.message || '';
       }
@@ -1679,7 +1679,7 @@ async function openRow(id) {
   wrap.innerHTML = `
     <div class="expand">
       <div class="expand-block"><h4>Loading detail…</h4>
-        <div class="expand-empty">Fetching <span class="mono">/data/items/${id}.json</span>…</div></div>
+        <div class="expand-empty">Loading item history…</div></div>
     </div>`;
   wrap.style.maxHeight = wrap.scrollHeight + 'px';
   wrap.classList.add('open');
@@ -1714,8 +1714,11 @@ function currentItemForId(id) {
 async function loadItemDetail(itemId) {
   if (App.itemDetailCache[itemId] !== undefined) return App.itemDetailCache[itemId];
   try {
-    const detail = await fetchJSON(`data/items/${itemId}.json`, { allowMissing: true });
-    App.itemDetailCache[itemId] = detail;  // null if 404 (publish ran without --include-items)
+    const detail = await fetchJSON(`/api/items/${itemId}`, { allowMissing: true });
+    // null when /api/items/<id> returns 404 (item not in D1). Shouldn't
+    // happen from a row that came out of /api/report/latest, but cache
+    // the null either way so a chevron toggle doesn't refetch.
+    App.itemDetailCache[itemId] = detail;
     return detail;
   } catch (err) {
     App.itemDetailCache[itemId] = null;
@@ -1728,10 +1731,9 @@ function expandHTML(it, detail) {
     return `
       <div class="expand">
         <div class="expand-block" style="grid-column: 1 / -1;">
-          <h4>Per-item detail not available</h4>
+          <h4>Item details unavailable</h4>
           <div class="expand-empty">
-            <div>No <span class="mono">/data/items/${it.id}.json</span> for this report.</div>
-            <div class="e-sub">Run <span class="mono">dota-deals publish --include-items</span> to populate it.</div>
+            <div>This item's history can't be fetched right now.</div>
           </div>
           <div style="margin-top:18px;">
             ${dqAndCompositeHTML(it, detail)}
@@ -2009,7 +2011,7 @@ async function loadHistorical(dateStr) {
     dom.banner.textContent = msg;
   };
   try {
-    const report = await fetchJSON(`data/history/${dateStr}.json`, { allowMissing: true });
+    const report = await fetchJSON(`/api/report/${dateStr}`, { allowMissing: true });
     if (!report) {
       inlineBanner(`No report for ${dateStr}. (Most often: signals + score haven’t run yet for this date.)`);
       return;
