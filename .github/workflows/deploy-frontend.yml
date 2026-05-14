@@ -1,17 +1,33 @@
-name: deploy
+name: deploy-frontend
 
-# Manual-only Cloudflare Pages deploy. Added in Phase 12 to bypass a
-# regional outage (Cloudflare's Manila edge in extended maintenance
-# blocked `npm run deploy` from the operator's machine), but the value
-# is durable: deploys now ship from GitHub's US-based runners
-# regardless of which Cloudflare edge the operator's local network
-# resolves to.
+# Cloudflare Pages deploy for the frontend (static + Pages Functions).
+# Two triggers:
 #
-# Phase 13 may add a `push:` trigger for auto-deploy on main. For now
-# this is operator-driven: trigger via Actions tab → deploy →
-# "Run workflow", or via `gh workflow run deploy.yml`.
+#  - ``push`` to main, gated by a paths filter so only changes that
+#    actually affect the deploy artifact fire it. Documentation,
+#    Python pipeline, and tests don't ship to the edge, so editing
+#    them doesn't burn a build.
+#  - ``workflow_dispatch`` for manual runs (Actions tab → deploy-
+#    frontend → "Run workflow", or ``gh workflow run
+#    deploy-frontend.yml``). Useful as a fallback when a previous
+#    deploy attempt failed mid-upload (the Phase 12 Manila-edge
+#    outage was the original trigger for adding this workflow).
+#
+# Phase 13 promoted this from manual-only to the primary deploy
+# path: ``npm run deploy`` from an operator shell is still
+# supported as a fallback, but pushing to main is now the canonical
+# trigger.
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "public/**"
+      - "functions/**"
+      - "package.json"
+      - "package-lock.json"
+      - "wrangler.toml"
+      - ".github/workflows/deploy-frontend.yml"
   workflow_dispatch:
 
 # No git writes, no PR comments — only network egress to Cloudflare's
@@ -20,11 +36,14 @@ on:
 permissions:
   contents: read
 
-# Don't let two manual deploys race to upload the same artifact. The
-# pipeline workflow has its own `pipeline` group; this is distinct.
+# A push that lands while another deploy is mid-flight should win:
+# the new artifact is what ``main`` reflects now, so the older
+# upload should be cancelled. (Distinct from the ``pipeline``
+# group used by ``.github/workflows/pipeline.yml``, which has the
+# opposite policy — pipeline runs can't be cancelled mid-write.)
 concurrency:
-  group: deploy
-  cancel-in-progress: false
+  group: deploy-frontend
+  cancel-in-progress: true
 
 env:
   # Read by wrangler. CLOUDFLARE_API_TOKEN was extended with

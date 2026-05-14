@@ -31,6 +31,11 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
+    # Vestigial from the v1 SQLite era — production code reads from D1
+    # exclusively (Phase 9 cutover). Kept here because test fixtures in
+    # tests/conftest.py still pass it through ``Settings(db_path=...)``
+    # for historical-shape compatibility with the sync test scaffolding.
+    # Not load-bearing; setting it changes no live behaviour.
     db_path: Path = Field(default=Path("./data/dota_deals.db"))
 
     steam_concurrency: int = Field(default=2, ge=1, le=10)
@@ -42,18 +47,6 @@ class Settings(BaseSettings):
     ingest_cadence_hours: int = Field(default=8, ge=1, le=24)
 
     log_format: LogFormat = Field(default="console")
-
-    # Cloudflare R2 (S3-compatible). Vestigial through Phase 13: the
-    # GHA pipeline no longer calls ``dota-deals db pull`` / ``db push``
-    # since storage moved to D1 in Phase 9, but the publish.r2 module
-    # and these settings remain in-tree so removing them is a single
-    # Phase 13 commit rather than spread across multiple. Leave unset;
-    # setting them has no effect on the live pipeline.
-    r2_endpoint: str | None = Field(default=None)
-    r2_bucket: str | None = Field(default=None)
-    r2_access_key_id: str | None = Field(default=None)
-    r2_secret_access_key: str | None = Field(default=None)
-    r2_db_key: str = Field(default="dota_deals.db")
 
     # Cloudflare D1 (HTTP REST). All four fields below must be set together
     # for the D1 client to start. The client raises :class:`D1ConfigError`

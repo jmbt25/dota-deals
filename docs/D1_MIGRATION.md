@@ -14,10 +14,11 @@ document how the live storage layer behaves.
 
 ## Migration narrative
 
-The path from R2-synced SQLite to async D1 took eight commits. Each
-phase produced at least one reality-only bug that no mocked test
-could have caught; every such bug is now pinned by a regression test
-listed in the table.
+The path from R2-synced SQLite + static-JSON publishing to async D1
++ Pages Functions took the commits below. Each cutover phase
+produced at least one reality-only bug that no mocked test could
+have caught; every such bug is pinned by a regression test or a
+dedicated section of this doc.
 
 | Commit | Phase | What landed | Reality-only catch |
 |---|---|---|---|
@@ -29,14 +30,23 @@ listed in the table.
 | `e5a2d89` | 9c-ii | Cut signals layer + `DataLookup` pre-fetch pattern (O(items × signals) HTTP calls → ~8 total) | D1 `/query` batch shape must be `{"batch": [...]}` not a bare array (HTTP 400 code 7400) |
 | `44b5776` | 9c-iii | Cut scoring/publish/universe runners + bulk-read functions | D1 per-statement bound-parameter limit is 100, not the SQLite default of 999 (`too many SQL variables`) |
 | `8527795` | 9c-iv | Delete sync code; rename `*_async` → unsuffixed; consolidate docs | — |
-| `<this commit>` | 10 | GHA workflow rewrite: D1 migrate step, ingest/signals/score against D1, R2 sync removed, publish step removed | — |
+| Phase 10 | GHA workflow rewrite: D1 migrate step, ingest/signals/score against D1, R2 sync removed, publish step removed | `CLOUDFLARE_ACCOUNT_ID` missing → wrangler hits `/memberships` → 403 from account-scoped token (see `docs/DEPLOYMENT.md` failure-recovery row) |
+| `fffbce8` | 11 | TypeScript Pages Functions at `/api/*` (5 endpoints + middleware + types + 38 vitest tests) | recurring Cloudflare build-token invalidation; first Pages-side deploy attempt hit `.mypy_cache` exceeding Pages' 25 MiB-per-file limit |
+| `f74a074` | 12 | Frontend `fetch()` rewired from `/data/*.json` to `/api/*`; site live against real D1 at `dotadeals.com` | wrangler 4.x local `pages dev` 404s on the static frontend at `/` while serving `/api/*` correctly (production unaffected) |
+| `fd3cf8f` | 12 follow-on | `.github/workflows/deploy.yml` workflow_dispatch deploy bypass | Cloudflare's Manila edge in extended maintenance blocked local `npm run deploy`; GH runners (US-based) hit a different edge |
+| Phase 13 (this commit) | Delete `publish/`, `publish.r2`, `db pull`/`db push` CLI commands, R2 `Settings` fields, `public/data/`, `docs/PUBLISH.md`; promote `deploy.yml` → `deploy-frontend.yml` with `push` trigger | — |
 
-The pattern across the phases: every cutover commit produced one
-reality-only bug. The smoke-test discipline (each cutover phase
-finished with a manual run against real D1, not just the mocked
-test suite) is what caught them before the live cron noticed. That
-workflow choice is worth more than any individual technical
-decision in the migration.
+The pattern across the phases: every cutover commit produced at
+least one reality-only bug. The smoke-test discipline (each
+cutover phase finished with a manual run against real D1, not just
+the mocked test suite) is what caught them before the live cron
+noticed. That workflow choice is worth more than any individual
+technical decision in the migration.
+
+The arc ended at `v2.0`: D1 is the only storage path, Pages
+Functions is the only frontend data path, deploy is one
+auto-triggering GHA workflow plus a manual fallback. No vestigial
+paths remain in production code.
 
 ## Why D1
 

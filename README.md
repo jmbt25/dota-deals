@@ -139,12 +139,11 @@ exercised via curl as shown above and the frontend visually
 against the preview deploy.
 
 The wire-format contract for every endpoint is documented in
-[`functions/types.ts`](functions/types.ts), kept in lock-step with
-the Pydantic models in [`src/dota_deals/publish/models.py`](src/dota_deals/publish/models.py)
-that the publish layer used pre-Phase-11. Hand-crafted state
-fixtures still live in [`public/data/fixtures/`](public/data/fixtures/)
-as reference artifacts of the wire format; they are no longer
-load-bearing for local dev. Phase 13 will retire them.
+[`functions/types.ts`](functions/types.ts) and pinned by the vitest
+suite at [`functions/__tests__/`](functions/__tests__/). The static
+JSON publishing layer (Python `publish/` module, `public/data/`
+fixtures) that originally produced this contract was deleted in
+Phase 13; the types in TypeScript are now the only source of truth.
 
 ## Deployment
 

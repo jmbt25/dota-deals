@@ -20,8 +20,11 @@ field on the top-level envelope; errors return a structured
 | GET | `/api/runs?limit=20` | Recent pipeline runs across all kinds, ordered by `started_at` desc. `limit` defaults to 20, clamps to [1, 100]. 400 if `limit` isn't a positive integer. Debug/ops view — not part of the user-facing surface. |
 
 Response details (field shapes, nullable fields, USD-string format) live
-in [functions/types.ts](../functions/types.ts), which is the canonical
-TypeScript mirror of [src/dota_deals/publish/models.py](../src/dota_deals/publish/models.py).
+in [functions/types.ts](../functions/types.ts), the single source of
+truth for the wire format. (Pre-Phase-13 the contract was kept in
+lock-step with the Python `publish/models.py` Pydantic models; that
+module was deleted in the Phase 13 cleanup once the frontend stopped
+reading static JSON.)
 
 ### Common headers
 
@@ -39,9 +42,8 @@ before returning; the middleware only sets it when absent.
 
 ## Wire-format conventions
 
-Hand-maintained 1:1 with `src/dota_deals/publish/models.py`. The two
-must emit identical JSON during the Phase 11 → 12 cutover so the
-frontend's contract is preserved.
+Defined in [`functions/types.ts`](../functions/types.ts); the rules
+the rendering JS in `public/index.html` depends on:
 
 - **Dates**: ISO `YYYY-MM-DD` strings.
 - **Datetimes**: ISO 8601 with a trailing `Z` (UTC only).
@@ -55,12 +57,11 @@ frontend's contract is preserved.
 - **Envelopes**: `schema_version: 1` on every top-level payload.
   Reserved for future wire-format migrations.
 
-### Maintenance burden
-
-Any change to `publish/models.py` MUST be mirrored in `functions/types.ts`
-in the same commit. There is no code-gen tooling that enforces this —
-adding one cost more than it saves at v1 scale. Re-evaluate post-v2 if
-either side drifts.
+The contract is pinned by the vitest suite at
+[`functions/__tests__/`](../functions/__tests__/): every endpoint has
+a test that asserts the wire shape against the
+`functions/__tests__/seed.sql` baseline. Drift between the rendering
+JS and the API breaks the suite locally before it can ship.
 
 ## Local development
 
@@ -167,19 +168,6 @@ dash.cloudflare.com → **Workers & Pages → D1 → dota-deals → Query Logs**
 gives per-query timings and the offending SQL. For local repro, copy
 the SQL and run it with `wrangler d1 execute dota-deals --local --command "..."`.
 
-## Phase 11 to 12 transition
-
-This is the API half of the migration; the frontend cutover (Phase 12)
-swaps `fetch("/data/latest.json")` → `fetch("/api/report/latest")`. Until
-that ships, the API endpoints are live but the frontend at
-dotadeals.com keeps reading the now-stale `public/data/*.json` files.
-The frontend's broken state is documented in `docs/DEPLOYMENT.md` —
-"Known gap during Phase 10 - 12".
-
-Phase 13 removes the static publish layer entirely: `publish/builder.py`,
-`publish/r2.py`, the GHA publish step, and `public/data/`. The Worker
-API becomes the only source of truth for the frontend's data.
-
 ## Endpoint internals: where the SQL lives
 
 Each handler file (`functions/api/<endpoint>.ts`) contains its own SQL,
@@ -188,9 +176,9 @@ inlined. Queries that are genuinely shared between endpoints —
 live in [functions/queries.ts](../functions/queries.ts) so the two
 report endpoints don't drift.
 
-The Python `publish/builder.py` was the reference implementation; the
-TypeScript queries are line-for-line equivalent and exist on the Worker
-side because the D1 binding API (promise-based, native to the Workers
-runtime) is shaped differently enough from the Python HTTP client that
-sharing a translation layer would have been more work than restating
-the SQL.
+The Python `publish/builder.py` was the original reference
+implementation; it was deleted in Phase 13 once the frontend
+stopped reading static JSON. The TypeScript queries here remain
+line-for-line equivalent to what `builder.py` did against the
+async storage layer — re-deriving them later from the test suite
+or D1 schema is straightforward if needed.

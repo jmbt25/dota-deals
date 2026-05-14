@@ -12,9 +12,10 @@ dota-deals signals compute --date 2026-05-12
 dota-deals signals compute -d 2026-05-12
 ```
 
-Defaults to today's UTC date if `--date` is omitted. The run reads from
-`Settings.db_path` (set via `.env` or the env-var `DB_PATH`) and writes both
-`signals` rows and one `runs` row tagged `kind='signals'`.
+Defaults to today's UTC date if `--date` is omitted. The run reads
+from Cloudflare D1 via the credentials in `.env` (or the
+`CLOUDFLARE_*` env vars) and writes both `signals` rows and one
+`runs` row tagged `kind='signals'`.
 
 ## Inspecting a run
 

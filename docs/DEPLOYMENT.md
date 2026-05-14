@@ -17,19 +17,20 @@
 ┌──────────────────────────────────────────────────────────────┐
 │  Cloudflare Pages → dotadeals.com                            │
 │                                                              │
-│   Static frontend (public/)  STALE through Phase 12          │
-│   serves the public/data/ JSON committed at Phase 10 ship.   │
+│   Static frontend (public/index.html) + Pages Functions      │
+│   (functions/api/*). Frontend fetches /api/health,           │
+│   /api/report/latest, /api/report/:date, /api/items/:id,     │
+│   /api/runs straight from D1 — no static JSON in the         │
+│   serving path.                                              │
 │                                                              │
-│   Pages Functions (functions/api/*)  LIVE as of Phase 11     │
-│   /api/health, /api/report/latest, /api/report/:date,        │
-│   /api/items/:id, /api/runs — read directly from D1.         │
+│   Deploys: push to main → .github/workflows/deploy-          │
+│   frontend.yml fires when public/**, functions/**,           │
+│   package*.json, or wrangler.toml change. Manual fallback    │
+│   via `npm run deploy` from an operator shell.               │
 │                                                              │
-│   Deploys: `wrangler pages deploy public ...` from local     │
-│   (Git auto-deploy intentionally off — see "Lessons from     │
-│   Phase 11 deploy" below for why).                           │
-│                                                              │
-│   Phase 12 wires the frontend at fetch() to /api/, ending    │
-│   the static-files stale window.                             │
+│   Pages Git auto-deploy (the dashboard's built-in build      │
+│   container) is intentionally off — see "Lessons from        │
+│   Phase 11 deploy" below.                                    │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -41,42 +42,40 @@ Two pieces of infra outside the repo:
 2. **Cloudflare Pages project** — serves `public/` as a static site
    plus the Pages Functions in `functions/`. Deploys happen via
    `wrangler pages deploy public --project-name=dota-deals
-   --branch=main` from an operator shell (the only place we still
-   pull this trigger; see "Lessons from Phase 11 deploy" for the
-   history). The project was recreated from scratch on 2026-05-14
-   after the previous project was lost during a build-token
-   troubleshooting session; the new project has **no Git
-   integration** by design.
+   --branch=main`, fired automatically by
+   [`.github/workflows/deploy-frontend.yml`](../.github/workflows/deploy-frontend.yml)
+   on every push to main that touches the deploy artifact. The
+   project was recreated from scratch on 2026-05-14 after the
+   previous project was lost during a build-token troubleshooting
+   session; the new project has **no Pages-side Git integration**
+   by design — see "Lessons from Phase 11 deploy" below.
 
 Everything below is one-time setup. Once it's done the pipeline runs
-unattended; you only return for failures, feature work, or shipping
-a new Worker bundle (which is now a deliberate operator command, not
-an on-push side effect).
+unattended; you only return for failures or feature work.
 
-## Known gap during Phases 10 – 12
+## Migration completed
 
-The live frontend at `dotadeals.com` is intentionally stale through
-this window:
+The Phase 10 – 13 migration from R2-synced SQLite + static JSON to D1
++ Pages Functions is complete as of `v2.0`. The story across the four
+phases:
 
-- **Phase 10** (this commit): the pipeline stops generating
-  `public/data/*.json`. The committed files frozen at the Phase 10
-  ship commit are what Pages keeps serving.
-- **Phase 11** (this commit): a TypeScript Worker (Pages Functions)
-  serves the same wire format the static files used, reading D1
-  directly. Endpoints live at `/api/health`, `/api/report/latest`,
-  `/api/report/:date`, `/api/items/:id`, `/api/runs`. The frontend
-  isn't pointed at them yet, so the live page stays stale.
-- **Phase 12**: the frontend's `fetch()` calls are pointed at the
-  Worker. From this point the page is live against D1 again.
-- **Phase 13**: the static-files path retires; `publish/` module
-  and `public/data/` are deleted.
+- **Phase 10** — GHA pipeline cut over to D1 directly; the
+  `dota-deals db pull` / `db push` R2 sync steps were removed.
+- **Phase 11** — TypeScript Pages Functions shipped at
+  `/api/health`, `/api/report/latest`, `/api/report/:date`,
+  `/api/items/:id`, `/api/runs`. Wire format kept byte-identical
+  to what the Python publish layer used to emit.
+- **Phase 12** — frontend `fetch()` calls rewired from
+  `/data/*.json` to `/api/*`. End of the planned-stale window.
+- **Phase 13** — Python `publish/` module, `publish.r2` client, the
+  `dota-deals publish` / `db pull` / `db push` CLI commands,
+  `public/data/`, and the corresponding tests all retired in one
+  cleanup commit. The R2_* `Settings` fields and `.env.example`
+  block deleted; the R2 bucket can be removed in the Cloudflare
+  dashboard at the operator's convenience.
 
-This is deliberate. No production users are watching during the v1
-build-out, so trading "frontend stale for a week or two" for
-"cleaner cutover commits" was a conscious decision. If you find a
-user during this window, the message is: "the data is current in
-D1 (visible via `wrangler d1 execute --remote ...`), the
-public-facing view is on a planned-stale period through Phase 12."
+See [`docs/D1_MIGRATION.md`](D1_MIGRATION.md) for the full migration
+narrative.
 
 ## One-time: GitHub Actions secrets
 
@@ -180,23 +179,48 @@ dashboard → My Profile → API Tokens → edit the token in place
 rotation). The token value stays the same; no need to update
 `.env` or repo secrets.
 
-### Git integration is intentionally OFF
+### Deploy paths
 
-The Pages project has **no GitHub connection**. Pushing to main
-does NOT trigger a deploy. This is by design — Cloudflare's
-build container relies on a separate build token that has
-invalidated twice in our short history (Phase 8 and again during
-the Phase 11 ship). Routing the deploy through `wrangler pages
-deploy` from an authenticated shell bypasses the build container
-entirely; the only token in play is the wrangler one, which the
-operator controls.
+Two ways to ship a frontend or Functions change to production:
 
-Trade-off accepted: no PR deploy previews (Cloudflare's Pages
-build container handled those). For a single-developer v1 with
-no preview-environment workflow this is a small loss. If preview
-deploys become valuable in v2+, the right move is probably a
-GitHub Action that runs `wrangler pages deploy` against a branch-
-named project, not reconnecting the dashboard Git integration.
+1. **Auto-deploy via GitHub Actions (primary).** Push to main with
+   a change under `public/`, `functions/`, `package*.json`, or
+   `wrangler.toml` →
+   [`.github/workflows/deploy-frontend.yml`](../.github/workflows/deploy-frontend.yml)
+   fires on a US-based runner → ~30 second deploy → live at
+   `dotadeals.com`. The paths filter on the workflow keeps doc-
+   only commits and Python pipeline changes from burning a build.
+
+2. **Manual deploy via `npm run deploy` (fallback).** Runs the same
+   `wrangler pages deploy public --project-name=dota-deals
+   --branch=main` from the operator's shell. Useful when:
+   - GitHub Actions is down
+   - You want to test a deploy before pushing the corresponding
+     commit (deploy from a dirty working tree with
+     `npm run deploy -- --commit-dirty=true`)
+   - The auto-deploy workflow itself needs to be debugged
+   - Cloudflare's edge in your region is in maintenance (the
+     Phase 12 Manila outage was the original trigger to wire the
+     GHA path; running from the operator's machine can hit a
+     different edge than the GH runner does)
+
+   The fallback also requires `Cloudflare Pages: Edit` on your
+   `CLOUDFLARE_API_TOKEN`. If you only have the CI-shaped token,
+   trigger via `gh workflow run deploy-frontend.yml` instead.
+
+### Git integration is intentionally OFF (Pages dashboard)
+
+The Pages project has **no GitHub connection on the Cloudflare side**.
+The dashboard's built-in "Connect to Git" build container is what
+historically broke (build-token invalidation in Phase 8 and Phase 11);
+shipping via `wrangler pages deploy` — whether from a GH runner or
+an operator shell — bypasses that container entirely.
+
+Trade-off accepted: no PR deploy previews. For a single-developer
+v1 with no preview-environment workflow this is a small loss. If
+preview deploys become valuable in v2+, the right move is to add a
+second GHA workflow that deploys to a branch-named Pages project,
+not to re-enable the dashboard's Git integration.
 
 ## One-time: D1 schema
 
@@ -286,15 +310,22 @@ logs to diagnose.
 | `D1AuthError: D1 authentication failed (HTTP 401)` | The `CLOUDFLARE_D1_API_TOKEN` was rotated or never had `D1: Edit` on this database. | Recreate the token in the Cloudflare dashboard, update the GitHub secret. |
 | `D1NotFoundError: D1 endpoint returned 404` | Wrong `CLOUDFLARE_ACCOUNT_ID` or `CLOUDFLARE_D1_DATABASE_ID`. | Verify both via `wrangler d1 list`. |
 | `wrangler: command not found` in the migrate step | Node version mismatch or stale runner cache. | Re-run the workflow; the `npx` invocation pulls wrangler on demand. If persistent, pin the Node version in the workflow. |
-| `Authentication error [code: 10000]` from wrangler in the migrate step | `CLOUDFLARE_API_TOKEN` (the wrangler-side token, distinct from `CLOUDFLARE_D1_API_TOKEN`) is missing or has wrong scope. | Create the token with `Account → D1 → Edit + Account → Workers Scripts → Edit`, save as the `CLOUDFLARE_API_TOKEN` repo secret. |
+| `Authentication error [code: 10000]` from wrangler in the migrate step | `CLOUDFLARE_API_TOKEN` (the wrangler-side token, distinct from `CLOUDFLARE_D1_API_TOKEN`) is missing or has wrong scope. | Create the token with `Account → D1 → Edit + Account → Workers Scripts → Edit + Account → Cloudflare Pages → Edit`, save as the `CLOUDFLARE_API_TOKEN` repo secret. |
 | `signals run finished status=partial` with high `items_failed` | Most items have insufficient signal coverage (warmup, or an ingest-side regression broke the prior day's writes). | Inspect via `wrangler d1 execute --remote --command "SELECT signal_name, value, metadata_json FROM signals ORDER BY computed_for DESC LIMIT 20"`. |
-| `ingest run finished status=partial` | Steam returned 4xx/5xx for some items. Not a workflow failure — just a partial day. | Investigate in the next run's summary; if persistent, check Steam status or the rarity tag values. |
+| `ingest run finished status=partial` | Steam returned 4xx/5xx for some items. Not a workflow failure — just a partial day. The ~90 % rejection rate at universe scale is documented in [`docs/FUTURE.md`](FUTURE.md) "Steam Market 403s at universe scale". |
 | `too many SQL variables at offset N: SQLITE_ERROR` | A repository bulk-read passed > 100 bound parameters in one statement. The async repo's `_BULK_QUERY_CHUNK_SIZE=90` should prevent this for in-tree code; if a new call site triggers it, the fix is to chunk the IN clause. | Reduce chunk size or split the query. |
 | Workflow times out at 30m | Probably the ingest hit a sustained 429 storm. | Wait an hour; re-run with `skip_ingest=on` to push out the late-day stages on existing data. |
+| `deploy-frontend` workflow fails with 502 on `/pages/assets/upload` | Cloudflare's edge that the runner happens to hit is in maintenance. | Re-run the workflow (different runner → possibly different edge). If persistent, fall back to `npm run deploy` from your local machine, which routes through your ISP's edge rather than the GH runner's. |
 
-The "rolling back a bad publish" section that used to live here is
-gone with the publish step. Phase 11 reintroduces a "rolling back
-the Worker" story when the Worker exists.
+### Rolling back a bad deploy
+
+Pages keeps every deploy as an immutable artifact at a unique
+`*.pages.dev` subdomain. To roll back: dashboard → Workers & Pages
+→ `dota-deals` → Deployments → click any prior successful deploy
+→ "Rollback to this deployment". Takes effect at the edge within
+~30 seconds. Then revert the offending commit in git so the next
+`deploy-frontend` workflow run doesn't re-ship the same broken
+artifact.
 
 ## Lessons from Phase 11 deploy
 
