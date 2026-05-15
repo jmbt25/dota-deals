@@ -6,6 +6,23 @@ shows *why* an item is a good buy right now, with every score exposing its
 component signals so you can disagree intelligently. v1 is a fault-tolerant
 pipeline, not a trading strategy.
 
+## Architecture
+
+![dota-deals architecture](assets/architecture.png)
+
+The pipeline runs on a GitHub Actions cron every 8 hours. Each stage —
+universe refresh, ingest, signals, scoring — writes to Cloudflare D1 over
+HTTP and tags its row in the `runs` table with a shared `parent_run_id`,
+so a full batch is queryable as a single unit. The frontend at
+[dotadeals.com](https://dotadeals.com) reads from D1 via Cloudflare Pages
+Functions (`/api/*`); no SQLite file is shipped or synced.
+
+Reliability is enforced at three boundaries: ingest retries transient
+HTTP failures and routes invalid payloads to a `quarantine` dead-letter
+table; idempotent `(item, observed_at)` primary keys make every rerun a
+no-op; per-signal exception isolation means one signal's bug emits a
+null row instead of killing the run.
+
 ## How it works
 
 1. **`universe refresh`** scrapes Steam's market search for the arcana and
